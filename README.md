@@ -220,7 +220,98 @@ Example download URLs if the backend is running locally:
 
 ---
 
-## 4. Known Issues And Workarounds
+## 4. Setting Up On A New Mac/PC
+
+This section is for a completely new machine that has never run Audit C before.
+
+### Prerequisites to install
+
+- Android Studio: [https://developer.android.com/studio](https://developer.android.com/studio)
+- Python 3: [https://www.python.org/downloads](https://www.python.org/downloads)
+- Homebrew for macOS:
+
+```bash
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+```
+
+- ADB via Homebrew on Mac:
+
+```bash
+brew install android-platform-tools
+```
+
+- ADB via direct download on Windows:
+  - [https://developer.android.com/tools/releases/platform-tools](https://developer.android.com/tools/releases/platform-tools)
+
+### Clone the project
+
+```bash
+git clone https://github.com/Bellzum/Rokid_auditC_v2.git
+cd Rokid_auditC_v2
+```
+
+### Install Python dependencies
+
+```bash
+pip3 install fastapi uvicorn reportlab requests openai-whisper python-multipart --break-system-packages
+```
+
+### First time Android SDK setup
+
+```bash
+export JAVA_HOME='/Applications/Android Studio.app/Contents/jbr/Contents/Home'
+export PATH="$JAVA_HOME/bin:$PATH"
+export ANDROID_HOME="$HOME/Desktop/Rokid_auditC_v2/.android-sdk"
+export ANDROID_SDK_ROOT="$HOME/Desktop/Rokid_auditC_v2/.android-sdk"
+```
+
+### Enable ADB on glasses
+
+Do this one time only:
+
+1. Open the Hi Rokid app on your iPhone.
+2. Go to `Settings`.
+3. Open `Developer`.
+4. Turn on `Glasses ADB debugging`.
+
+### Every time you start a new session
+
+Run:
+
+```bash
+./run_auditc.sh
+```
+
+This script:
+
+- starts the backend
+- builds the Rokid Android app
+- installs the APK to the glasses
+- sets up the USB tunnel
+- launches the app
+
+### Windows differences
+
+- replace `export` with `set` for environment variables
+- replace `python3` with `python`
+- replace `pip3` with `pip`
+- add the `platform-tools` folder to the system `PATH`
+- set `JAVA_HOME` to Android Studio's JBR folder inside `Program Files`
+
+### Recommended first-time Mac workflow
+
+After cloning, your normal first-time setup becomes:
+
+```bash
+git clone https://github.com/Bellzum/Rokid_auditC_v2.git
+cd Rokid_auditC_v2
+./setup.sh
+./run_auditc.sh
+```
+
+---
+
+## 5. Known Issues And Workarounds
 
 ### App goes to background
 
@@ -231,6 +322,18 @@ Workaround:
 ```bash
 adb -s YOUR_DEVICE_ID shell am force-stop com.auditc.glasses
 adb -s YOUR_DEVICE_ID shell am start -n com.auditc.glasses/.MainActivity
+```
+
+### App freezes on RV101
+
+Workaround:
+
+- the app may freeze occasionally on RV101 due to hardware constraints
+- it should auto-recover within 8 seconds
+- if it does not recover, run:
+
+```bash
+adb -s 1901092546044163 shell am force-stop com.auditc.glasses && adb -s 1901092546044163 reverse tcp:8000 tcp:8000 && adb -s 1901092546044163 shell am start -n com.auditc.glasses/.MainActivity
 ```
 
 ### Name not heard
@@ -269,7 +372,7 @@ adb -s YOUR_DEVICE_ID reverse tcp:8000 tcp:8000
 
 ---
 
-## 5. Next Steps / Roadmap
+## 6. Next Steps / Roadmap
 
 - Fix report generation from glasses if any remaining device-side edge cases appear during live use.
 - Add equipment detection using the glasses camera plus a lightweight YOLO-based model.
@@ -306,7 +409,7 @@ adb -s YOUR_DEVICE_ID reverse tcp:8000 tcp:8000
 
 ---
 
-## 6. Team
+## 7. Team
 
 - **Biomedical domain expert** — protocol design, QC validation, demo narrative
 - Built with TRAE SOLO + Claude Sonnet

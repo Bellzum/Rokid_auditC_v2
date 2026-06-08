@@ -8,14 +8,15 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.graphics.Color
-import android.media.AudioManager
 import android.media.AudioFormat
+import android.media.AudioManager
 import android.media.AudioRecord
 import android.media.MediaRecorder
 import android.media.ToneGenerator
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.speech.tts.TextToSpeech
 import android.view.KeyEvent
 import android.view.View
@@ -24,6 +25,12 @@ import android.widget.TextView
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.MultipartBody
 import okhttp3.OkHttpClient
@@ -35,12 +42,19 @@ import java.io.File
 import java.io.FileOutputStream
 import java.io.RandomAccessFile
 import java.util.Locale
+import java.util.concurrent.Executors
+import java.util.concurrent.Future
+import java.util.concurrent.ScheduledFuture
+import java.util.concurrent.TimeUnit
 import kotlin.math.max
 
 class MainActivity : AppCompatActivity() {
 
     private val client = OkHttpClient()
     private val handler = Handler(Looper.getMainLooper())
+    private val uiScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    private val audioExecutor = Executors.newSingleThreadExecutor()
+    private val watchdogExecutor = Executors.newSingleThreadScheduledExecutor()
     private val jsonMediaType = "application/json".toMediaType()
 
     private lateinit var headerConnectionDot: View
@@ -55,7 +69,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var tts: TextToSpeech
     private var toneGenerator: ToneGenerator? = null
     private var audioRecord: AudioRecord? = null
-    private var recordingThread: Thread? = null
+    private var recordingFuture: Future<*>? = null
+    private var watchdogFuture: ScheduledFuture<*>? = null
 
     private val sopSteps = listOf(
         "Step 1: Sample Collection",
@@ -74,6 +89,22 @@ class MainActivity : AppCompatActivity() {
     private var recordingActive = false
     private var overlayTimer: Runnable? = null
     private var recordingStopRunnable: Runnable? = null
+    private var lastUiHeartbeatMs = 0L
+    @Volatile private var restartInProgress = false
+    private var isExitingApp = false
+    private var lastOverlayBackground: String? = null
+    private var lastOverlayText: String? = null
+    private var lastOverlayTextSizeSp: Float? = null
+    private var lastOverlayVisible = false
+
+    private val uiHeartbeatRunnable = object : Runnable {
+        override fun run() {
+            lastUiHeartbeatMs = SystemClock.elapsedRealtime()
+            if (!isFinishing && !isDestroyed) {
+                handler.postDelayed(this, UI_HEARTBEAT_INTERVAL_MS)
+            }
+        }
+    }
 
     private val requestAudioPermission = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
@@ -81,7 +112,7 @@ class MainActivity : AppCompatActivity() {
         if (granted) {
             deferredVoiceMode?.let { beginVoiceCapture(it) }
         } else {
-            statusBoxText.text = "(microphone permission denied)"
+            updateStatusText("(microphone permission denied)")
             showOverlay(
                 background = "#CCFF0000",
                 text = "MICROPHONE ACCESS REQUIRED",
@@ -130,13 +161,7 @@ class MainActivity : AppCompatActivity() {
         logObservationButton = findViewById(R.id.logObservationButton)
         generateReportButton = findViewById(R.id.generateReportButton)
 
-        updateStepDisplay()
-        updateConnectionStatus(false)
-        setControlsEnabled(false)
-
-        micButton.setOnClickListener {
-            startGeneralVoiceRecognition()
-        }
+        micButton.setOnClickListener { startGeneralVoiceRecognition() }
         logObservationButton.setOnClickListener {
             if (ensureSessionStarted()) {
                 startObservationVoiceCapture()
@@ -149,7 +174,6 @@ class MainActivity : AppCompatActivity() {
         }
 
         toneGenerator = ToneGenerator(AudioManager.STREAM_NOTIFICATION, 100)
-
         tts = TextToSpeech(this) { status ->
             if (status == TextToSpeech.SUCCESS) {
                 tts.language = Locale.ENGLISH
@@ -164,13 +188,29 @@ class MainActivity : AppCompatActivity() {
             }
         )
 
+        restoreProgressState(savedInstanceState)
+        updateStepDisplay()
+        updateConnectionStatus(false)
+        setControlsEnabled(sessionStarted)
+        if (!sessionStarted) {
+            updateStatusText("(awaiting technician name)")
+        }
+
         setupCxrBridge()
-        handler.post { startTechnicianNameFlow() }
+        if (savedInstanceState == null && !sessionStarted) {
+            handler.post { startTechnicianNameFlow() }
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        startWatchdog()
     }
 
     override fun onPause() {
+        stopWatchdog()
         super.onPause()
-        if (!isFinishing && !isDestroyed) {
+        if (!restartInProgress && !isExitingApp && !isFinishing && !isDestroyed) {
             handler.post {
                 try {
                     getSystemService(ActivityManager::class.java)
@@ -183,12 +223,31 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    override fun onSaveInstanceState(outState: Bundle) {
+        saveProgressState(outState)
+        super.onSaveInstanceState(outState)
+    }
+
+    override fun onRestoreInstanceState(savedInstanceState: Bundle) {
+        super.onRestoreInstanceState(savedInstanceState)
+        restoreProgressState(savedInstanceState)
+        updateStepDisplay()
+        setControlsEnabled(sessionStarted)
+    }
+
     override fun onDestroy() {
-        unregisterReceiver(keyReceiver)
+        try {
+            unregisterReceiver(keyReceiver)
+        } catch (_: Exception) {
+        }
+        stopWatchdog()
         stopRecordingSession()
         overlayTimer?.let { handler.removeCallbacks(it) }
         toneGenerator?.release()
         toneGenerator = null
+        uiScope.cancel()
+        audioExecutor.shutdownNow()
+        watchdogExecutor.shutdownNow()
         if (::tts.isInitialized) {
             tts.shutdown()
         }
@@ -202,6 +261,52 @@ class MainActivity : AppCompatActivity() {
                 true
             }
             else -> super.onKeyDown(keyCode, event)
+        }
+    }
+
+    private fun startWatchdog() {
+        lastUiHeartbeatMs = SystemClock.elapsedRealtime()
+        handler.removeCallbacks(uiHeartbeatRunnable)
+        handler.post(uiHeartbeatRunnable)
+        watchdogFuture?.cancel(false)
+        watchdogFuture = watchdogExecutor.scheduleAtFixedRate(
+            {
+                val elapsed = SystemClock.elapsedRealtime() - lastUiHeartbeatMs
+                if (!restartInProgress && elapsed > UI_WATCHDOG_TIMEOUT_MS) {
+                    requestActivityRestart()
+                }
+            },
+            UI_WATCHDOG_TIMEOUT_MS,
+            UI_WATCHDOG_CHECK_INTERVAL_MS,
+            TimeUnit.MILLISECONDS,
+        )
+    }
+
+    private fun stopWatchdog() {
+        handler.removeCallbacks(uiHeartbeatRunnable)
+        watchdogFuture?.cancel(true)
+        watchdogFuture = null
+    }
+
+    private fun requestActivityRestart() {
+        if (restartInProgress || isFinishing || isDestroyed) {
+            return
+        }
+        restartInProgress = true
+        handler.post {
+            showPersistentOverlay(
+                background = "#CC000000",
+                text = "Restarting...",
+                textSizeSp = 30f,
+            )
+            handler.postDelayed(
+                {
+                    if (!isFinishing && !isDestroyed) {
+                        recreate()
+                    }
+                },
+                RESTART_OVERLAY_DURATION_MS,
+            )
         }
     }
 
@@ -243,9 +348,10 @@ class MainActivity : AppCompatActivity() {
         playBeep()
 
         recordingStopRunnable?.let { handler.removeCallbacks(it) }
-        handler.postDelayed({
-            startAudioRecording()
-        }, BEEP_DELAY_MS)
+        handler.postDelayed(
+            { startAudioRecording() },
+            BEEP_DELAY_MS,
+        )
     }
 
     private fun startAudioRecording() {
@@ -282,19 +388,19 @@ class MainActivity : AppCompatActivity() {
 
             audioRecord = recorder
             recordingActive = true
-            statusBoxText.text = when (pendingVoiceMode) {
-                VoiceMode.CAPTURE_NAME -> "Listening for technician name..."
-                VoiceMode.CONFIRM_NAME -> "Listening for confirmation..."
-                VoiceMode.OBSERVATION -> "Listening for observation..."
-                VoiceMode.GENERAL -> "Listening..."
-            }
+            updateStatusText(
+                when (pendingVoiceMode) {
+                    VoiceMode.CAPTURE_NAME -> "Listening for technician name..."
+                    VoiceMode.CONFIRM_NAME -> "Listening for confirmation..."
+                    VoiceMode.OBSERVATION -> "Listening for observation..."
+                    VoiceMode.GENERAL -> "Listening..."
+                }
+            )
 
             recorder.startRecording()
-            val worker = Thread {
+            recordingFuture = audioExecutor.submit {
                 writeWaveFile(recorder, outputFile, bufferSize)
             }
-            recordingThread = worker
-            worker.start()
 
             val stopRunnable = Runnable { stopAudioRecording(outputFile) }
             recordingStopRunnable = stopRunnable
@@ -318,16 +424,31 @@ class MainActivity : AppCompatActivity() {
         }
         recorder.release()
 
-        val worker = recordingThread
-        recordingThread = null
-        statusBoxText.text = "Transcribing..."
-        Thread {
-            try {
-                worker?.join()
-            } catch (_: InterruptedException) {
+        val future = recordingFuture
+        recordingFuture = null
+        updateStatusText("Transcribing...")
+        showPersistentOverlay(
+            background = "#CC000000",
+            text = "TRANSCRIBING...",
+            textSizeSp = 30f,
+        )
+
+        uiScope.launch {
+            val transcript = withContext(Dispatchers.IO) {
+                try {
+                    future?.get()
+                } catch (_: Exception) {
+                }
+                requestTranscript(outputFile)
             }
-            transcribeRecordedAudio(outputFile)
-        }.start()
+            outputFile.delete()
+            if (transcript.isNullOrBlank()) {
+                handleRecognitionFailure("Transcription failed.")
+            } else {
+                updateStatusText(transcript)
+                routeRecognizedText(transcript)
+            }
+        }
     }
 
     private fun stopRecordingSession() {
@@ -340,10 +461,11 @@ class MainActivity : AppCompatActivity() {
         }
         audioRecord?.release()
         audioRecord = null
-        recordingThread = null
+        recordingFuture?.cancel(true)
+        recordingFuture = null
     }
 
-    private fun transcribeRecordedAudio(audioFile: File) {
+    private fun requestTranscript(audioFile: File): String? {
         val requestBody = MultipartBody.Builder()
             .setType(MultipartBody.FORM)
             .addFormDataPart(
@@ -357,30 +479,20 @@ class MainActivity : AppCompatActivity() {
             .post(requestBody)
             .build()
 
-        try {
+        return try {
             client.newCall(request).execute().use { response ->
                 if (!response.isSuccessful) {
-                    throw IllegalStateException("Transcription failed: ${response.code}")
-                }
-                val payload = JSONObject(response.body?.string().orEmpty())
-                val spokenText = payload
-                    .optString("text")
-                    .ifBlank { payload.optString("transcript") }
-                    .trim()
-                if (spokenText.isBlank()) {
-                    throw IllegalStateException("No speech recognized")
-                }
-                runOnUiThread {
-                    statusBoxText.text = spokenText
-                    routeRecognizedText(spokenText)
+                    null
+                } else {
+                    val payload = JSONObject(response.body?.string().orEmpty())
+                    payload.optString("text")
+                        .ifBlank { payload.optString("transcript") }
+                        .trim()
+                        .ifBlank { null }
                 }
             }
         } catch (_: Exception) {
-            runOnUiThread {
-                handleRecognitionFailure("Transcription failed.")
-            }
-        } finally {
-            audioFile.delete()
+            null
         }
     }
 
@@ -425,25 +537,29 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun RandomAccessFile.writeIntLE(value: Int) {
-        write(byteArrayOf(
-            (value and 0xff).toByte(),
-            ((value shr 8) and 0xff).toByte(),
-            ((value shr 16) and 0xff).toByte(),
-            ((value shr 24) and 0xff).toByte(),
-        ))
+        write(
+            byteArrayOf(
+                (value and 0xff).toByte(),
+                ((value shr 8) and 0xff).toByte(),
+                ((value shr 16) and 0xff).toByte(),
+                ((value shr 24) and 0xff).toByte(),
+            )
+        )
     }
 
     private fun RandomAccessFile.writeShortLE(value: Short) {
-        write(byteArrayOf(
-            (value.toInt() and 0xff).toByte(),
-            ((value.toInt() shr 8) and 0xff).toByte(),
-        ))
+        write(
+            byteArrayOf(
+                (value.toInt() and 0xff).toByte(),
+                ((value.toInt() shr 8) and 0xff).toByte(),
+            )
+        )
     }
 
     private fun handleRecognitionFailure(message: String) {
         when (pendingVoiceMode) {
             VoiceMode.CAPTURE_NAME -> {
-                statusBoxText.text = message
+                updateStatusText(message)
                 showOverlay(
                     background = "#CCFF0000",
                     text = "NAME NOT HEARD. TRY AGAIN.",
@@ -452,7 +568,7 @@ class MainActivity : AppCompatActivity() {
                 handler.postDelayed({ startTechnicianNameFlow() }, 1900)
             }
             VoiceMode.CONFIRM_NAME -> {
-                statusBoxText.text = message
+                updateStatusText(message)
                 showOverlay(
                     background = "#CCFF0000",
                     text = "SAY YES OR NO",
@@ -461,7 +577,7 @@ class MainActivity : AppCompatActivity() {
                 handler.postDelayed({ beginVoiceCapture(VoiceMode.CONFIRM_NAME) }, 1900)
             }
             VoiceMode.OBSERVATION -> {
-                statusBoxText.text = message
+                updateStatusText(message)
                 showOverlay(
                     background = "#CCFF0000",
                     text = "OBSERVATION NOT HEARD",
@@ -469,7 +585,7 @@ class MainActivity : AppCompatActivity() {
                 )
             }
             VoiceMode.GENERAL -> {
-                statusBoxText.text = message
+                updateStatusText(message)
                 showOverlay(
                     background = "#CCFF0000",
                     text = "VOICE INPUT NOT HEARD",
@@ -486,7 +602,7 @@ class MainActivity : AppCompatActivity() {
                     background = "#CC000000",
                     text = "Say your name after the beep",
                 )
-                statusBoxText.text = "Preparing name capture..."
+                updateStatusText("Preparing name capture...")
             }
             VoiceMode.CONFIRM_NAME -> {
                 val candidate = pendingNameCandidate ?: "UNKNOWN"
@@ -495,7 +611,7 @@ class MainActivity : AppCompatActivity() {
                     text = "Your name is $candidate\nSay Yes to confirm or No to try again",
                     textSizeSp = 28f,
                 )
-                statusBoxText.text = "Confirming technician name..."
+                updateStatusText("Confirming technician name...")
             }
             VoiceMode.OBSERVATION -> {
                 showPersistentOverlay(
@@ -503,7 +619,7 @@ class MainActivity : AppCompatActivity() {
                     text = "State your observation after the beep",
                     textSizeSp = 28f,
                 )
-                statusBoxText.text = "Preparing observation capture..."
+                updateStatusText("Preparing observation capture...")
             }
             VoiceMode.GENERAL -> {
                 showPersistentOverlay(
@@ -511,7 +627,7 @@ class MainActivity : AppCompatActivity() {
                     text = "Speak now",
                     textSizeSp = 30f,
                 )
-                statusBoxText.text = "Preparing voice command..."
+                updateStatusText("Preparing voice command...")
             }
         }
     }
@@ -574,7 +690,7 @@ class MainActivity : AppCompatActivity() {
         sessionStarted = true
         pendingNameCandidate = null
         setControlsEnabled(true)
-        statusBoxText.text = "Technician: $displayName"
+        updateStatusText("Technician: $displayName")
         showOverlay(
             background = "#CC00FF41",
             text = "YOUR NAME IS $displayName",
@@ -587,22 +703,35 @@ class MainActivity : AppCompatActivity() {
     private fun handleSpokenText(spokenText: String) {
         val normalized = spokenText.lowercase(Locale.ENGLISH)
         when {
-            normalized.contains("generate txt report") || normalized.contains("generate text report") -> {
-                generateReport("txt")
-            }
-            normalized.contains("generate pdf report") -> {
-                generateReport("pdf")
-            }
-            normalized.contains("generate report") -> {
-                generateReport("pdf")
-            }
-            else -> {
-                verifyStep(spokenText)
-            }
+            normalized.contains("exit app") || normalized.contains("quit app") -> exitApp()
+            normalized.contains("generate txt report") || normalized.contains("generate text report") -> generateReport("txt")
+            normalized.contains("generate pdf report") -> generateReport("pdf")
+            normalized.contains("generate report") -> generateReport("pdf")
+            else -> verifyStep(spokenText)
         }
     }
 
     private fun verifyStep(spokenText: String) {
+        showPersistentOverlay(
+            background = "#66000000",
+            text = "VERIFYING STEP...",
+            textSizeSp = 28f,
+        )
+        uiScope.launch {
+            val result = withContext(Dispatchers.IO) { requestStepVerification(spokenText) }
+            if (result == null) {
+                showFailOverlay()
+            } else if (result.result == "pass") {
+                showPassOverlay()
+                sendResultToPhone(result.result, result.stepName)
+            } else {
+                showFailOverlay()
+                sendResultToPhone(result.result, result.stepName)
+            }
+        }
+    }
+
+    private fun requestStepVerification(spokenText: String): StepResultPayload? {
         val body = JSONObject().apply {
             put("spoken_text", spokenText)
             put("step_number", currentStep + 1)
@@ -613,31 +742,47 @@ class MainActivity : AppCompatActivity() {
             .post(body)
             .build()
 
-        Thread {
-            try {
-                client.newCall(request).execute().use { response ->
+        return try {
+            client.newCall(request).execute().use { response ->
+                if (!response.isSuccessful) {
+                    null
+                } else {
                     val json = JSONObject(response.body?.string().orEmpty())
-                    val result = json.optString("result", "fail")
-                    val stepName = json.optString("step_name", sopSteps.getOrNull(currentStep).orEmpty())
-                    runOnUiThread {
-                        if (result == "pass") {
-                            showPassOverlay()
-                            sendResultToPhone(result, stepName)
-                        } else {
-                            showFailOverlay()
-                            sendResultToPhone(result, stepName)
-                        }
-                    }
-                }
-            } catch (_: Exception) {
-                runOnUiThread {
-                    showFailOverlay()
+                    StepResultPayload(
+                        result = json.optString("result", "fail"),
+                        stepName = json.optString("step_name", sopSteps.getOrNull(currentStep).orEmpty()),
+                    )
                 }
             }
-        }.start()
+        } catch (_: Exception) {
+            null
+        }
     }
 
     private fun logObservation(text: String) {
+        showPersistentOverlay(
+            background = "#66000000",
+            text = "LOGGING OBSERVATION...",
+            textSizeSp = 28f,
+        )
+        uiScope.launch {
+            val flagged = withContext(Dispatchers.IO) { requestObservationLog(text) }
+            if (flagged == null) {
+                showFailOverlay()
+            } else if (flagged) {
+                showIssueFlaggedOverlay()
+            } else {
+                showOverlay(
+                    background = "#CC00FF41",
+                    text = "OBSERVATION LOGGED",
+                    durationMs = 1800,
+                )
+                tts.speak("Observation logged.", TextToSpeech.QUEUE_FLUSH, null, null)
+            }
+        }
+    }
+
+    private fun requestObservationLog(text: String): Boolean? {
         val body = JSONObject().apply {
             put("spoken_text", text)
             put("step_number", currentStep + 1)
@@ -648,33 +793,50 @@ class MainActivity : AppCompatActivity() {
             .post(body)
             .build()
 
-        Thread {
-            try {
-                client.newCall(request).execute().use { response ->
+        return try {
+            client.newCall(request).execute().use { response ->
+                if (!response.isSuccessful) {
+                    null
+                } else {
                     val json = JSONObject(response.body?.string().orEmpty())
                     val entry = json.optJSONObject("entry")
-                    val flagged = entry?.optBoolean("flagged", false) ?: false
-                    runOnUiThread {
-                        if (flagged) {
-                            showIssueFlaggedOverlay()
-                        } else {
-                            showOverlay(
-                                background = "#CC00FF41",
-                                text = "OBSERVATION LOGGED",
-                                durationMs = 1800,
-                            )
-                            tts.speak("Observation logged.", TextToSpeech.QUEUE_FLUSH, null, null)
-                        }
-                    }
+                    entry?.optBoolean("flagged", false) ?: false
                 }
-            } catch (_: Exception) {
-                runOnUiThread { showFailOverlay() }
             }
-        }.start()
+        } catch (_: Exception) {
+            null
+        }
     }
 
     private fun generateReport(format: String) {
         val effectiveName = technicianName ?: "Audit C Glasses"
+        showPersistentOverlay(
+            background = "#66000000",
+            text = "GENERATING ${format.uppercase(Locale.ENGLISH)}...",
+            textSizeSp = 28f,
+        )
+        uiScope.launch {
+            val reportPath = withContext(Dispatchers.IO) { requestReportGeneration(format, effectiveName) }
+            if (reportPath == null) {
+                showFailOverlay()
+            } else {
+                updateStatusText(reportPath)
+                showOverlay(
+                    background = "#CC00FF41",
+                    text = "${format.uppercase(Locale.ENGLISH)} REPORT READY",
+                    durationMs = 2500,
+                )
+                tts.speak(
+                    "${format.uppercase(Locale.ENGLISH)} report generated successfully.",
+                    TextToSpeech.QUEUE_FLUSH,
+                    null,
+                    null,
+                )
+            }
+        }
+    }
+
+    private fun requestReportGeneration(format: String, effectiveName: String): String? {
         val body = JSONObject().apply {
             put("technician_name", effectiveName)
             put("user_name", effectiveName)
@@ -685,33 +847,34 @@ class MainActivity : AppCompatActivity() {
             .post(body)
             .build()
 
-        Thread {
-            try {
-                client.newCall(request).execute().use { response ->
-                    if (!response.isSuccessful) {
-                        throw IllegalStateException("Report generation failed: ${response.code}")
-                    }
-                    val json = JSONObject(response.body?.string().orEmpty())
-                    val reportPath = json.optString("report_path", "pathguard_report.$format")
-                    runOnUiThread {
-                        statusBoxText.text = reportPath
-                        showOverlay(
-                            background = "#CC00FF41",
-                            text = "${format.uppercase(Locale.ENGLISH)} REPORT READY",
-                            durationMs = 2500,
-                        )
-                        tts.speak(
-                            "${format.uppercase(Locale.ENGLISH)} report generated successfully.",
-                            TextToSpeech.QUEUE_FLUSH,
-                            null,
-                            null,
-                        )
-                    }
+        return try {
+            client.newCall(request).execute().use { response ->
+                if (!response.isSuccessful) {
+                    null
+                } else {
+                    JSONObject(response.body?.string().orEmpty())
+                        .optString("report_path", "pathguard_report.$format")
                 }
-            } catch (_: Exception) {
-                runOnUiThread { showFailOverlay() }
             }
-        }.start()
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private fun exitApp() {
+        if (isExitingApp) {
+            return
+        }
+        isExitingApp = true
+        showPersistentOverlay(
+            background = "#CC000000",
+            text = "Goodbye",
+            textSizeSp = 30f,
+        )
+        handler.postDelayed(
+            { finish() },
+            EXIT_OVERLAY_DURATION_MS,
+        )
     }
 
     private fun setControlsEnabled(enabled: Boolean) {
@@ -729,7 +892,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun updateStepDisplay() {
-        currentStepText.text = sopSteps.getOrNull(currentStep) ?: "(no step)"
+        setTextIfChanged(currentStepText, sopSteps.getOrNull(currentStep) ?: "(no step)")
     }
 
     private fun advanceStep(delta: Int) {
@@ -778,7 +941,7 @@ class MainActivity : AppCompatActivity() {
         textSizeSp: Float = 34f,
     ) {
         showPersistentOverlay(background, text, textSizeSp)
-        val hide = Runnable { overlay.visibility = View.GONE }
+        val hide = Runnable { hideOverlay() }
         overlayTimer?.let { handler.removeCallbacks(it) }
         overlayTimer = hide
         handler.postDelayed(hide, durationMs)
@@ -791,33 +954,97 @@ class MainActivity : AppCompatActivity() {
     ) {
         overlayTimer?.let { handler.removeCallbacks(it) }
         overlayTimer = null
-        overlay.setBackgroundColor(Color.parseColor(background))
-        overlayText.textSize = textSizeSp
-        overlayText.text = text
-        overlay.visibility = View.VISIBLE
+        applyOverlayState(background, text, textSizeSp, true)
     }
 
     private fun hideOverlay() {
         overlayTimer?.let { handler.removeCallbacks(it) }
         overlayTimer = null
-        overlay.visibility = View.GONE
+        applyOverlayState(
+            background = lastOverlayBackground ?: "#000000",
+            text = lastOverlayText.orEmpty(),
+            textSizeSp = lastOverlayTextSizeSp ?: 34f,
+            visible = false,
+        )
+    }
+
+    private fun applyOverlayState(
+        background: String,
+        text: String,
+        textSizeSp: Float,
+        visible: Boolean,
+    ) {
+        if (
+            lastOverlayBackground == background &&
+            lastOverlayText == text &&
+            lastOverlayTextSizeSp == textSizeSp &&
+            lastOverlayVisible == visible
+        ) {
+            return
+        }
+        lastOverlayBackground = background
+        lastOverlayText = text
+        lastOverlayTextSizeSp = textSizeSp
+        lastOverlayVisible = visible
+        overlay.setBackgroundColor(Color.parseColor(background))
+        overlayText.textSize = textSizeSp
+        setTextIfChanged(overlayText, text)
+        overlay.visibility = if (visible) View.VISIBLE else View.GONE
     }
 
     private fun showCompletionReport() {
-        overlayTimer?.let { handler.removeCallbacks(it) }
-        overlayTimer = null
-        overlay.setBackgroundColor(Color.BLACK)
-        overlayText.textSize = 24f
-        overlayText.text = buildString {
-            appendLine("AUDIT C REPORT")
-            appendLine()
-            stepPassed.forEachIndexed { index, passed ->
-                appendLine("STEP ${index + 1}: ${if (passed) "PASS" else "PENDING"}")
-            }
-            appendLine()
-            append("ALL STEPS VERIFIED")
+        showPersistentOverlay(
+            background = "#FF000000",
+            text = buildString {
+                appendLine("AUDIT C REPORT")
+                appendLine()
+                stepPassed.forEachIndexed { index, passed ->
+                    appendLine("STEP ${index + 1}: ${if (passed) "PASS" else "PENDING"}")
+                }
+                appendLine()
+                append("ALL STEPS VERIFIED")
+            },
+            textSizeSp = 24f,
+        )
+    }
+
+    private fun setTextIfChanged(view: TextView, value: String) {
+        if (view.text.toString() != value) {
+            view.text = value
         }
-        overlay.visibility = View.VISIBLE
+    }
+
+    private fun updateStatusText(text: String) {
+        setTextIfChanged(statusBoxText, text)
+    }
+
+    private fun saveProgressState(bundle: Bundle) {
+        bundle.putString(STATE_TECHNICIAN_NAME, technicianName)
+        bundle.putString(STATE_PENDING_NAME, pendingNameCandidate)
+        bundle.putString(STATE_PENDING_VOICE_MODE, pendingVoiceMode.name)
+        bundle.putInt(STATE_CURRENT_STEP, currentStep)
+        bundle.putBoolean(STATE_SESSION_STARTED, sessionStarted)
+        bundle.putBooleanArray(STATE_STEP_PASSED, stepPassed.toBooleanArray())
+        bundle.putString(STATE_STATUS_TEXT, statusBoxText.text.toString())
+    }
+
+    private fun restoreProgressState(bundle: Bundle?) {
+        if (bundle == null) {
+            return
+        }
+        technicianName = bundle.getString(STATE_TECHNICIAN_NAME)
+        pendingNameCandidate = bundle.getString(STATE_PENDING_NAME)
+        currentStep = bundle.getInt(STATE_CURRENT_STEP, 0)
+        sessionStarted = bundle.getBoolean(STATE_SESSION_STARTED, false)
+        bundle.getString(STATE_PENDING_VOICE_MODE)
+            ?.let { value -> pendingVoiceMode = runCatching { VoiceMode.valueOf(value) }.getOrDefault(VoiceMode.GENERAL) }
+        val restoredSteps = bundle.getBooleanArray(STATE_STEP_PASSED)
+        restoredSteps?.forEachIndexed { index, passed ->
+            if (index < stepPassed.size) {
+                stepPassed[index] = passed
+            }
+        }
+        updateStatusText(bundle.getString(STATE_STATUS_TEXT, statusBoxText.text?.toString() ?: "(awaiting input)"))
     }
 
     private fun setupCxrBridge() {
@@ -877,6 +1104,11 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private data class StepResultPayload(
+        val result: String,
+        val stepName: String,
+    )
+
     companion object {
         private const val BASE_URL = "http://127.0.0.1:8000"
         private const val SAMPLE_RATE_HZ = 16000
@@ -886,6 +1118,18 @@ class MainActivity : AppCompatActivity() {
         private const val RECORDING_DURATION_MS = 5000L
         private const val BEEP_DELAY_MS = 400L
         private const val BEEP_DURATION_MS = 180L
+        private const val UI_WATCHDOG_TIMEOUT_MS = 8000L
+        private const val UI_WATCHDOG_CHECK_INTERVAL_MS = 2000L
+        private const val UI_HEARTBEAT_INTERVAL_MS = 1000L
+        private const val RESTART_OVERLAY_DURATION_MS = 500L
+        private const val EXIT_OVERLAY_DURATION_MS = 1000L
+        private const val STATE_TECHNICIAN_NAME = "state_technician_name"
+        private const val STATE_PENDING_NAME = "state_pending_name"
+        private const val STATE_PENDING_VOICE_MODE = "state_pending_voice_mode"
+        private const val STATE_CURRENT_STEP = "state_current_step"
+        private const val STATE_SESSION_STARTED = "state_session_started"
+        private const val STATE_STEP_PASSED = "state_step_passed"
+        private const val STATE_STATUS_TEXT = "state_status_text"
     }
 
     private enum class VoiceMode {

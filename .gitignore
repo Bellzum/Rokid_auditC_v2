@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+
+**/.gradle/
+**/.idea/
+**/build/
+**/local.properties
+
+models/*.bin

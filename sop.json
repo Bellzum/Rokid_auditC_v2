@@ -1,0 +1,34 @@
+{
+  "steps": [
+    {
+      "step_name": "Sample Collection",
+      "voice_keywords": ["sample", "collect", "swab", "nasal", "throat"],
+      "description": "Collect respiratory sample from patient using swab"
+    },
+    {
+      "step_name": "RNA Extraction",
+      "voice_keywords": ["extract", "rna", "nucleic", "isolation", "purify"],
+      "description": "Extract RNA from collected sample"
+    },
+    {
+      "step_name": "Reverse Transcription",
+      "voice_keywords": ["reverse", "transcription", "cdna", "rt", "complement"],
+      "description": "Convert RNA to complementary DNA"
+    },
+    {
+      "step_name": "PCR Master Mix Preparation",
+      "voice_keywords": ["master", "mix", "prepare", "reagent", "primer", "probe"],
+      "description": "Prepare PCR reaction mixture with primers and probes"
+    },
+    {
+      "step_name": "Thermal Cycling",
+      "voice_keywords": ["thermal", "cycle", "amplify", "pcr", "temperature", "denature", "anneal", "extend"],
+      "description": "Run PCR thermal cycling for DNA amplification"
+    },
+    {
+      "step_name": "Detection and Analysis",
+      "voice_keywords": ["detect", "analyze", "result", "positive", "negative", "ct value", "cycle threshold"],
+      "description": "Detect and analyze amplification results"
+    }
+  ]
+}

@@ -1,0 +1,715 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <title>Audit C</title>
+  <style>
+    :root {
+      --bg: #000000;
+      --hud: #66ff88;
+      --hud-dim: #9dffb3;
+      --hud-soft: rgba(102, 255, 136, 0.14);
+      --hud-border: rgba(102, 255, 136, 0.35);
+      --info: #8fc9ff;
+      --danger: #ff5757;
+      --danger-soft: rgba(255, 87, 87, 0.16);
+      --safe-soft: rgba(0, 255, 102, 0.18);
+    }
+
+    * {
+      box-sizing: border-box;
+      -webkit-tap-highlight-color: transparent;
+    }
+
+    html,
+    body {
+      margin: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: var(--bg);
+      color: var(--hud);
+      font-family: "SFMono-Regular", "Menlo", "Consolas", "Liberation Mono", monospace;
+    }
+
+    body {
+      position: fixed;
+      inset: 0;
+      overscroll-behavior: none;
+    }
+
+    .app {
+      position: relative;
+      width: 100%;
+      height: 100%;
+      padding:
+        calc(env(safe-area-inset-top) + 16px)
+        16px
+        calc(env(safe-area-inset-bottom) + 18px)
+        16px;
+      display: flex;
+      flex-direction: column;
+      background:
+        radial-gradient(circle at top right, rgba(0, 255, 80, 0.08), transparent 34%),
+        radial-gradient(circle at bottom center, rgba(0, 140, 255, 0.06), transparent 32%),
+        linear-gradient(180deg, rgba(255, 255, 255, 0.015), rgba(255, 255, 255, 0));
+    }
+
+    .hud-top {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      align-items: flex-start;
+    }
+
+    .header {
+      font-size: 12px;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: var(--hud-dim);
+      opacity: 0.95;
+      text-shadow: 0 0 12px rgba(102, 255, 136, 0.25);
+    }
+
+    .session-user {
+      font-size: 13px;
+      color: #e3ffe9;
+    }
+
+    .current-step {
+      display: inline-flex;
+      flex-direction: column;
+      gap: 4px;
+      padding: 12px 14px;
+      border: 1px solid var(--hud-border);
+      background: var(--hud-soft);
+      border-radius: 14px;
+      box-shadow: inset 0 0 0 1px rgba(102, 255, 136, 0.08), 0 0 22px rgba(0, 255, 102, 0.08);
+      max-width: min(88vw, 420px);
+    }
+
+    .step-label {
+      font-size: 12px;
+      color: var(--hud-dim);
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+
+    .step-value {
+      font-size: 20px;
+      line-height: 1.3;
+      color: var(--hud);
+      text-shadow: 0 0 12px rgba(102, 255, 136, 0.22);
+    }
+
+    .center-panel {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      gap: 14px;
+      min-height: 0;
+    }
+
+    .transcript-box,
+    .status-box,
+    .report-box {
+      border: 1px solid rgba(102, 255, 136, 0.18);
+      border-radius: 14px;
+      background: rgba(255, 255, 255, 0.02);
+      padding: 14px;
+      box-shadow: inset 0 0 20px rgba(102, 255, 136, 0.03);
+    }
+
+    .transcript-box {
+      min-height: 124px;
+    }
+
+    .panel-title {
+      margin-bottom: 8px;
+      font-size: 11px;
+      color: var(--hud-dim);
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+    }
+
+    .transcript,
+    .status,
+    .report-status {
+      font-size: 16px;
+      line-height: 1.5;
+      color: #e3ffe9;
+      word-break: break-word;
+    }
+
+    .status,
+    .report-status {
+      color: var(--info);
+      font-size: 14px;
+    }
+
+    .bottom-controls {
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }
+
+    .secondary-row {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+    }
+
+    .control-btn,
+    .mic-btn {
+      border: 1px solid var(--hud-border);
+      background: rgba(255, 255, 255, 0.04);
+      color: var(--hud);
+      font: inherit;
+      border-radius: 16px;
+      cursor: pointer;
+      transition: transform 120ms ease, box-shadow 120ms ease, background 120ms ease;
+    }
+
+    .control-btn:active,
+    .mic-btn:active {
+      transform: scale(0.98);
+    }
+
+    .control-btn {
+      min-height: 54px;
+      font-size: 14px;
+      letter-spacing: 0.03em;
+      text-transform: uppercase;
+      box-shadow: 0 0 20px rgba(102, 255, 136, 0.05);
+    }
+
+    .mic-wrap {
+      display: flex;
+      justify-content: center;
+      padding-top: 4px;
+    }
+
+    .mic-btn {
+      width: min(28vw, 112px);
+      height: min(28vw, 112px);
+      min-width: 90px;
+      min-height: 90px;
+      border-radius: 999px;
+      font-size: 30px;
+      background: radial-gradient(circle at 30% 30%, rgba(102, 255, 136, 0.22), rgba(102, 255, 136, 0.08));
+      box-shadow:
+        0 0 0 1px rgba(102, 255, 136, 0.2),
+        0 0 30px rgba(0, 255, 90, 0.12),
+        inset 0 0 28px rgba(255, 255, 255, 0.03);
+    }
+
+    .mic-btn.listening {
+      animation: pulse 1.1s infinite;
+      background: radial-gradient(circle at 30% 30%, rgba(255, 87, 87, 0.36), rgba(255, 87, 87, 0.12));
+      color: #fff;
+      border-color: rgba(255, 87, 87, 0.45);
+    }
+
+    .overlay {
+      position: fixed;
+      inset: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+      background: transparent;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 180ms ease;
+    }
+
+    .overlay.visible {
+      opacity: 1;
+    }
+
+    .overlay.pass {
+      background: rgba(0, 255, 102, 0.22);
+    }
+
+    .overlay.fail {
+      background: rgba(255, 0, 0, 0.26);
+    }
+
+    .overlay-card {
+      width: min(92vw, 480px);
+      text-align: center;
+      border-radius: 20px;
+      padding: 28px 20px;
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      background: rgba(0, 0, 0, 0.62);
+      box-shadow: 0 0 50px rgba(0, 0, 0, 0.35);
+    }
+
+    .overlay-title {
+      font-size: clamp(28px, 7vw, 42px);
+      line-height: 1.2;
+      font-weight: 700;
+      margin-bottom: 12px;
+    }
+
+    .overlay-subtitle {
+      font-size: clamp(16px, 4.4vw, 22px);
+      line-height: 1.4;
+      color: #f2fff5;
+      white-space: pre-line;
+    }
+
+    .overlay.pass .overlay-title {
+      color: #66ff88;
+      text-shadow: 0 0 20px rgba(102, 255, 136, 0.45);
+    }
+
+    .overlay.fail .overlay-title {
+      color: #ff6868;
+      text-shadow: 0 0 20px rgba(255, 104, 104, 0.45);
+    }
+
+    .notice {
+      display: none;
+      margin-top: 8px;
+      font-size: 13px;
+      color: #ffd36a;
+      line-height: 1.5;
+    }
+
+    .notice.visible {
+      display: block;
+    }
+
+    @keyframes pulse {
+      0% { transform: scale(1); box-shadow: 0 0 0 0 rgba(255, 87, 87, 0.4); }
+      70% { transform: scale(1.03); box-shadow: 0 0 0 22px rgba(255, 87, 87, 0); }
+      100% { transform: scale(1); box-shadow: 0 0 0 0 rgba(255, 87, 87, 0); }
+    }
+
+    @media (min-width: 768px) {
+      .app {
+        max-width: 560px;
+        margin: 0 auto;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <section class="hud-top">
+      <div class="header">Audit C | COVID-19 PCR QC</div>
+      <div class="session-user" id="sessionUserText">User: Not set</div>
+      <div class="current-step">
+        <div class="step-label">Current SOP Step</div>
+        <div class="step-value" id="currentStepText">Step 1: Sample Collection</div>
+      </div>
+    </section>
+
+    <section class="center-panel">
+      <div class="transcript-box">
+        <div class="panel-title">Recognized Voice</div>
+        <div class="transcript" id="recognizedText">Awaiting voice input...</div>
+      </div>
+
+      <div class="status-box">
+        <div class="panel-title">System Status</div>
+        <div class="status" id="statusText">Ready</div>
+      </div>
+
+      <div class="report-box">
+        <div class="panel-title">Report Status</div>
+        <div class="report-status" id="reportStatus">No report requested yet.</div>
+        <div class="notice" id="speechNotice">Speech recognition is only available in Safari/iOS and supported WebKit browsers.</div>
+      </div>
+    </section>
+
+    <section class="bottom-controls">
+      <div class="secondary-row">
+        <button class="control-btn" id="logObservationBtn" type="button">Log Observation</button>
+        <button class="control-btn" id="exportPdfBtn" type="button">Export PDF</button>
+      </div>
+      <div class="secondary-row">
+        <button class="control-btn" id="editUserBtn" type="button">Set User Name</button>
+        <button class="control-btn" id="exportTxtBtn" type="button">Export TXT</button>
+      </div>
+      <div class="mic-wrap">
+        <button class="mic-btn" id="micButton" type="button" aria-label="Start voice input">🎤</button>
+      </div>
+    </section>
+  </div>
+
+  <div class="overlay" id="overlay">
+    <div class="overlay-card">
+      <div class="overlay-title" id="overlayTitle"></div>
+      <div class="overlay-subtitle" id="overlaySubtitle"></div>
+    </div>
+  </div>
+
+  <script>
+    const BASE_URL = "http://192.168.1.11:8000";
+    const SOP_STEPS = [
+      "Sample Collection",
+      "RNA Extraction",
+      "Reverse Transcription",
+      "PCR Master Mix Preparation",
+      "Thermal Cycling",
+      "Detection and Analysis"
+    ];
+    const NEGATIVE_KEYWORDS = [
+      "contaminated",
+      "contamination",
+      "failed",
+      "failure",
+      "error",
+      "wrong",
+      "incorrect",
+      "mismatch",
+      "expired",
+      "missing",
+      "abnormal",
+      "unclear",
+      "turbid",
+      "leak",
+      "spill",
+      "broken"
+    ];
+
+    const state = {
+      currentStepIndex: 0,
+      listening: false,
+      overlayTimer: null,
+      userName: null
+    };
+
+    const currentStepText = document.getElementById("currentStepText");
+    const recognizedText = document.getElementById("recognizedText");
+    const statusText = document.getElementById("statusText");
+    const reportStatus = document.getElementById("reportStatus");
+    const sessionUserText = document.getElementById("sessionUserText");
+    const speechNotice = document.getElementById("speechNotice");
+    const micButton = document.getElementById("micButton");
+    const logObservationBtn = document.getElementById("logObservationBtn");
+    const exportPdfBtn = document.getElementById("exportPdfBtn");
+    const exportTxtBtn = document.getElementById("exportTxtBtn");
+    const editUserBtn = document.getElementById("editUserBtn");
+    const overlay = document.getElementById("overlay");
+    const overlayTitle = document.getElementById("overlayTitle");
+    const overlaySubtitle = document.getElementById("overlaySubtitle");
+
+    const SpeechRecognitionClass = window.webkitSpeechRecognition || window.SpeechRecognition;
+    let recognition = null;
+
+    async function requestMicrophonePermissionOnLoad() {
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        statusText.textContent = "Microphone permission API unavailable.";
+        return;
+      }
+
+      try {
+        await navigator.mediaDevices.getUserMedia({ audio: true });
+        statusText.textContent = "Microphone access ready.";
+      } catch (error) {
+        statusText.textContent = "Microphone permission was not granted.";
+      }
+    }
+
+    function initializeSpeechRecognition() {
+      if (!SpeechRecognitionClass) {
+        speechNotice.classList.add("visible");
+        statusText.textContent = "Speech recognition unavailable. Type input instead.";
+        return false;
+      }
+
+      recognition = new SpeechRecognitionClass();
+      recognition.lang = "en-US";
+      recognition.interimResults = false;
+      recognition.maxAlternatives = 1;
+      recognition.continuous = false;
+
+      recognition.onstart = () => {
+        setListeningUi(true);
+      };
+
+      recognition.onend = () => {
+        setListeningUi(false);
+      };
+
+      recognition.onerror = (event) => {
+        setListeningUi(false);
+        statusText.textContent = `Speech error: ${event.error}`;
+        promptForVerificationInput();
+      };
+
+      recognition.onresult = async (event) => {
+        setListeningUi(false);
+        const transcript = event.results?.[0]?.[0]?.transcript?.trim() || "";
+        if (!transcript) {
+          statusText.textContent = "No speech recognized.";
+          return;
+        }
+
+        recognizedText.textContent = transcript;
+
+        try {
+          await verifyStep(transcript);
+        } catch (error) {
+          statusText.textContent = `Request failed: ${error.message}`;
+          showOverlay("fail", "⚠ WARNING", "Backend request failed", 3000);
+        }
+      };
+
+      return true;
+    }
+
+    function updateCurrentStep() {
+      currentStepText.textContent = `Step ${state.currentStepIndex + 1}: ${SOP_STEPS[state.currentStepIndex]}`;
+    }
+
+    function updateUserNameUi() {
+      sessionUserText.textContent = `User: ${state.userName || "Not set"}`;
+    }
+
+    function ensureUserName() {
+      if (state.userName) {
+        return state.userName;
+      }
+
+      const existingValue = window.localStorage.getItem("auditcUserName") || "";
+      const promptText = existingValue
+        ? `Confirm or update user name:`
+        : "Enter user name for this audit session:";
+      const enteredValue = window.prompt(promptText, existingValue);
+      const normalized = (enteredValue || "").trim();
+      if (!normalized) {
+        state.userName = null;
+        window.localStorage.removeItem("auditcUserName");
+        updateUserNameUi();
+        return null;
+      }
+
+      state.userName = normalized;
+      window.localStorage.setItem("auditcUserName", normalized);
+      updateUserNameUi();
+      return normalized;
+    }
+
+    function findNegativeKeyword(text) {
+      const normalized = String(text || "").toLowerCase();
+      return NEGATIVE_KEYWORDS.find((keyword) => normalized.includes(keyword)) || null;
+    }
+
+    function setListeningUi(listening) {
+      state.listening = listening;
+      micButton.classList.toggle("listening", listening);
+      micButton.textContent = listening ? "■" : "🎤";
+    }
+
+    function showOverlay(mode, title, subtitle, durationMs, onDismiss) {
+      clearTimeout(state.overlayTimer);
+      overlay.classList.remove("pass", "fail");
+      overlay.classList.add("visible", mode);
+      overlayTitle.textContent = title;
+      overlaySubtitle.textContent = subtitle;
+
+      state.overlayTimer = setTimeout(() => {
+        overlay.classList.remove("visible", "pass", "fail");
+        if (typeof onDismiss === "function") {
+          onDismiss();
+        }
+      }, durationMs);
+    }
+
+    async function postJson(path, body) {
+      const response = await fetch(`${BASE_URL}${path}`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify(body)
+      });
+
+      const text = await response.text();
+      let data = {};
+      try {
+        data = text ? JSON.parse(text) : {};
+      } catch (error) {
+        throw new Error(`Invalid JSON response from ${path}`);
+      }
+
+      if (!response.ok) {
+        throw new Error(data.detail || `HTTP ${response.status}`);
+      }
+
+      return data;
+    }
+
+    async function verifyStep(spokenText) {
+      statusText.textContent = "Verifying step...";
+      const data = await postJson("/verify-step", {
+        spoken_text: spokenText,
+        step_number: state.currentStepIndex + 1,
+        user_name: ensureUserName()
+      });
+
+      if (String(data.result).toLowerCase() === "pass") {
+        statusText.textContent = "Verification passed.";
+        showOverlay("pass", "✓ VERIFIED", "", 2000, () => {
+          if (state.currentStepIndex < SOP_STEPS.length - 1) {
+            state.currentStepIndex += 1;
+            updateCurrentStep();
+          }
+        });
+      } else {
+        statusText.textContent = "Issue detected during verification.";
+        showOverlay("fail", "⚠ WARNING — ISSUE DETECTED", "", 3000);
+      }
+    }
+
+    async function logObservation(spokenText) {
+      statusText.textContent = "Logging observation...";
+      const matchedKeyword = findNegativeKeyword(spokenText);
+      const response = await fetch(`${BASE_URL}/log-observation`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          spoken_text: spokenText,
+          step_number: state.currentStepIndex + 1,
+          user_name: ensureUserName()
+        })
+      });
+
+      const responseText = await response.text();
+      let data = {};
+      try {
+        data = responseText ? JSON.parse(responseText) : {};
+      } catch (error) {
+        throw new Error("Invalid JSON response from /log-observation");
+      }
+
+      if (!response.ok) {
+        throw new Error(data.detail || `HTTP ${response.status}`);
+      }
+
+      if (!data.status || data.status !== "success") {
+        throw new Error("Observation log failed");
+      }
+
+      recognizedText.textContent = spokenText;
+      reportStatus.textContent = "Observation captured successfully.";
+
+      if (matchedKeyword) {
+        statusText.textContent = `Observation logged with issue detected: ${matchedKeyword}`;
+        reportStatus.textContent = `Flagged observation recorded for step ${state.currentStepIndex + 1}.`;
+        showOverlay("fail", "⚠ WARNING — ISSUE DETECTED", "", 3000);
+        return;
+      }
+
+      statusText.textContent = `Observation logged for step ${state.currentStepIndex + 1}.`;
+    }
+
+    function promptForVerificationInput() {
+      const typedInput = window.prompt("Enter spoken step text:");
+      if (!typedInput || !typedInput.trim()) {
+        statusText.textContent = "Voice entry cancelled.";
+        return;
+      }
+
+      recognizedText.textContent = typedInput.trim();
+
+      verifyStep(typedInput.trim()).catch((error) => {
+        statusText.textContent = `Request failed: ${error.message}`;
+        showOverlay("fail", "⚠ WARNING", "Backend request failed", 3000);
+      });
+    }
+
+    function beginRecognition() {
+      if (!recognition) {
+        const initialized = initializeSpeechRecognition();
+        if (!initialized) {
+          promptForVerificationInput();
+          return;
+        }
+      }
+
+      recognizedText.textContent = "Listening for SOP step...";
+      statusText.textContent = "Speak the SOP step now...";
+      setListeningUi(true);
+      try {
+        recognition.start();
+      } catch (error) {
+        setListeningUi(false);
+        statusText.textContent = "Unable to start voice capture.";
+        promptForVerificationInput();
+      }
+    }
+
+    async function generateReport(format) {
+      const activeButton = format === "txt" ? exportTxtBtn : exportPdfBtn;
+      activeButton.disabled = true;
+      reportStatus.textContent = `Generating ${String(format).toUpperCase()} report...`;
+      try {
+        const data = await postJson("/generate-report", {
+          specimen_id: "DEMO-4521",
+          technician_name: "Mobile Web Demo",
+          user_name: ensureUserName(),
+          format
+        });
+        const downloadUrl = data.download_url ? `${BASE_URL}${data.download_url}` : "";
+        reportStatus.textContent = `Report ready: ${data.report_path || `pathguard_report.${format}`}`;
+        if (downloadUrl) {
+          const downloadLink = document.createElement("a");
+          downloadLink.href = downloadUrl;
+          downloadLink.download = "";
+          document.body.appendChild(downloadLink);
+          downloadLink.click();
+          downloadLink.remove();
+        }
+      } catch (error) {
+        reportStatus.textContent = `Report failed: ${error.message}`;
+      } finally {
+        activeButton.disabled = false;
+      }
+    }
+
+    micButton.addEventListener("click", () => beginRecognition());
+    logObservationBtn.addEventListener("click", async () => {
+      const observation = window.prompt("Enter your observation:");
+      if (!observation || !observation.trim()) {
+        statusText.textContent = "Observation entry cancelled.";
+        return;
+      }
+
+      recognizedText.textContent = observation.trim();
+
+      try {
+        await logObservation(observation.trim());
+      } catch (error) {
+        statusText.textContent = `Observation failed: ${error.message}`;
+        showOverlay("fail", "⚠ WARNING", "Observation log failed", 3000);
+      }
+    });
+    exportPdfBtn.addEventListener("click", () => generateReport("pdf"));
+    exportTxtBtn.addEventListener("click", () => generateReport("txt"));
+    editUserBtn.addEventListener("click", () => {
+      state.userName = null;
+      ensureUserName();
+      statusText.textContent = state.userName
+        ? "User name updated for this session."
+        : "User name cleared.";
+    });
+
+    state.userName = (window.localStorage.getItem("auditcUserName") || "").trim() || null;
+    requestMicrophonePermissionOnLoad();
+    updateUserNameUi();
+    ensureUserName();
+    updateCurrentStep();
+  </script>
+</body>
+</html>

@@ -1,0 +1,3 @@
+rootProject.name = "AuditCGlasses"
+include ':app'
+

@@ -1,27 +1,30 @@
 from contextlib import asynccontextmanager
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, UploadFile, File
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
-from pydantic import BaseModel
 from datetime import datetime, timezone
 import json
 import os
-import requests
+import re
 import subprocess
 import tempfile
-from reportlab.lib import colors
+import traceback
+
+import requests
+from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Request, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from pydantic import BaseModel
 from reportlab.lib.pagesizes import letter
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import inch
-from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+from reportlab.platypus import Preformatted, SimpleDocTemplate, Spacer
+
+BASE_DIR = os.path.dirname(__file__)
+REPORTS_DIR = os.path.join(BASE_DIR, "reports")
+os.makedirs(REPORTS_DIR, exist_ok=True)
 
 MINIMAX_API_KEY = os.getenv("MINIMAX_API_KEY")
 MINIMAX_TTS_URL = "https://api.minimax.io/v1/t2a_v2"
-MINIMAX_TEXT_URL = "https://api.minimax.io/v1/text/chatcompletion_v2"
 WHISPER_MODEL_NAME = os.getenv("WHISPER_MODEL_NAME", "tiny")
-SESSION_LOG_PATH = os.path.join(os.path.dirname(__file__), "session_log.json")
-REPORT_PDF_PATH = os.path.join(os.path.dirname(__file__), "pathguard_report.pdf")
-REPORT_TXT_PATH = os.path.join(os.path.dirname(__file__), "pathguard_report.txt")
+SESSION_LOG_PATH = os.path.join(BASE_DIR, "session_log.json")
 TEST_NAME = "COVID-19 PCR"
 NEGATIVE_KEYWORDS = [
     "contaminated",
@@ -79,49 +82,20 @@ class GenerateReportRequest(BaseModel):
     technician_name: str = "UNKNOWN"
     user_name: str | None = None
     format: str = "pdf"
+    session_id: str | None = None
+    session: dict | None = None
 
 
-def load_sop_data():
-    sop_path = os.path.join(os.path.dirname(__file__), "sop.json")
-    with open(sop_path, "r") as f:
-        return json.load(f)
+def load_sop_data() -> dict:
+    sop_path = os.path.join(BASE_DIR, "sop.json")
+    with open(sop_path, "r", encoding="utf-8") as file_obj:
+        return json.load(file_obj)
 
 
 def print_sop_data_on_startup() -> None:
     sop_data = load_sop_data()
     print("Loaded sop.json:")
     print(json.dumps(sop_data, indent=2))
-
-
-def get_whisper_model():
-    global _WHISPER_MODEL
-    if _WHISPER_MODEL is not None:
-        return _WHISPER_MODEL
-
-    try:
-        import whisper
-    except ImportError as exc:
-        raise HTTPException(status_code=503, detail="openai-whisper is not installed") from exc
-
-    try:
-        _WHISPER_MODEL = whisper.load_model(WHISPER_MODEL_NAME)
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Failed to load Whisper model: {exc}") from exc
-
-    return _WHISPER_MODEL
-
-
-def transcribe_audio_file(audio_path: str) -> str:
-    model = get_whisper_model()
-    try:
-        result = model.transcribe(audio_path, language="en", fp16=False)
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Whisper transcription failed: {exc}") from exc
-
-    transcript = (result.get("text") or "").strip()
-    if not transcript:
-        raise HTTPException(status_code=422, detail="No speech recognized")
-    return transcript
 
 
 @asynccontextmanager
@@ -144,57 +118,179 @@ app.add_middleware(
 )
 
 
-def utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+@app.get("/health")
+def health():
+    return {"status": "ok"}
 
 
-def normalize_user_name(user_name: str | None) -> str | None:
+def utc_now_display() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+def utc_now_file_stamp() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+
+
+def normalize_user_name(user_name: str | None) -> str:
     if user_name is None:
-        return None
-    normalized = user_name.strip()
-    return normalized or None
+        return ""
+    return user_name.strip()
 
 
-def load_session_state() -> dict:
-    if not os.path.exists(SESSION_LOG_PATH):
-        return {"user_name": None, "entries": []}
+def normalize_timestamp(timestamp: str | None) -> str:
+    if not timestamp:
+        return ""
+    cleaned = timestamp.strip()
+    if not cleaned:
+        return ""
+    if cleaned.endswith(" UTC"):
+        return cleaned
+    try:
+        parsed = datetime.fromisoformat(cleaned.replace("Z", "+00:00"))
+        return parsed.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    except ValueError:
+        return cleaned
 
-    with open(SESSION_LOG_PATH, "r") as f:
-        data = json.load(f)
 
-    if isinstance(data, list):
-        return {"user_name": None, "entries": data}
+def sanitize_filename_component(value: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9]+", "_", value.strip().lower())
+    return safe.strip("_") or "unknown"
 
-    if not isinstance(data, dict):
-        raise HTTPException(status_code=500, detail="Invalid JSON in session_log.json")
 
-    entries = data.get("entries", [])
-    if not isinstance(entries, list):
-        raise HTTPException(status_code=500, detail="Invalid session entries in session_log.json")
-
+def create_default_session(sop_data: dict, user_name: str | None = None) -> dict:
+    steps = []
+    for index, step in enumerate(sop_data.get("steps", []), start=1):
+        steps.append(
+            {
+                "step_number": index,
+                "step_name": step.get("step_name", f"Step {index}"),
+                "voice_input": "",
+                "status": "pending",
+                "timestamp": "",
+            }
+        )
     return {
-        "user_name": normalize_user_name(data.get("user_name")),
-        "entries": entries,
+        "user_name": normalize_user_name(user_name),
+        "user_name_timestamp": "",
+        "steps": steps,
     }
 
 
-def load_session_log() -> list[dict]:
-    return load_session_state()["entries"]
+def update_session_user_name(session_state: dict, user_name: str | None, *, timestamp: str | None = None) -> None:
+    normalized = normalize_user_name(user_name)
+    if not normalized:
+        return
+    session_state["user_name"] = normalized
+    if not session_state.get("user_name_timestamp"):
+        session_state["user_name_timestamp"] = normalize_timestamp(timestamp) or utc_now_display()
+
+
+def get_step_record(session_state: dict, step_number: int | None, step_name: str | None = None) -> dict | None:
+    if step_number is None:
+        return None
+    steps = session_state.get("steps", [])
+    if not (1 <= step_number <= len(steps)):
+        return None
+    step_record = steps[step_number - 1]
+    if step_name:
+        step_record["step_name"] = step_name
+    return step_record
+
+
+def update_step_state(
+    session_state: dict,
+    *,
+    step_number: int | None,
+    step_name: str | None,
+    voice_input: str | None,
+    status: str | None,
+    timestamp: str | None = None,
+) -> dict | None:
+    step_record = get_step_record(session_state, step_number, step_name)
+    if step_record is None:
+        return None
+    if voice_input is not None:
+        step_record["voice_input"] = voice_input.strip()
+    if status is not None:
+        step_record["status"] = status
+    normalized_timestamp = normalize_timestamp(timestamp)
+    if normalized_timestamp:
+        step_record["timestamp"] = normalized_timestamp
+    elif step_record.get("status") != "pending" and not step_record.get("timestamp"):
+        step_record["timestamp"] = utc_now_display()
+    return step_record
+
+
+def migrate_legacy_entries(entries: list[dict], session_state: dict) -> dict:
+    for entry in entries:
+        timestamp = normalize_timestamp(entry.get("timestamp"))
+        update_session_user_name(session_state, entry.get("user_name"), timestamp=timestamp)
+        step_number = entry.get("step_number")
+        step_name = entry.get("step_name")
+        status = "pending"
+        if entry.get("flagged") or entry.get("result") == "fail":
+            status = "fail"
+        elif entry.get("result") == "pass":
+            status = "pass"
+        voice_input = entry.get("voice_input") or entry.get("observation") or ""
+        if step_number is not None:
+            update_step_state(
+                session_state,
+                step_number=step_number,
+                step_name=step_name,
+                voice_input=voice_input,
+                status=status,
+                timestamp=timestamp,
+            )
+    return session_state
+
+
+def migrate_session_data(data: object, sop_data: dict) -> dict:
+    session_state = create_default_session(sop_data)
+
+    if isinstance(data, list):
+        return migrate_legacy_entries(data, session_state)
+
+    if not isinstance(data, dict):
+        return session_state
+
+    if isinstance(data.get("steps"), list):
+        session_state["user_name"] = normalize_user_name(data.get("user_name"))
+        session_state["user_name_timestamp"] = normalize_timestamp(data.get("user_name_timestamp"))
+        for index, default_step in enumerate(session_state["steps"]):
+            incoming = data["steps"][index] if index < len(data["steps"]) and isinstance(data["steps"][index], dict) else {}
+            merged_step = {
+                "step_number": incoming.get("step_number", default_step["step_number"]),
+                "step_name": incoming.get("step_name", default_step["step_name"]),
+                "voice_input": incoming.get("voice_input", "") or "",
+                "status": incoming.get("status", "pending") or "pending",
+                "timestamp": normalize_timestamp(incoming.get("timestamp")),
+            }
+            if merged_step["status"] != "pending" and not merged_step["timestamp"]:
+                merged_step["timestamp"] = utc_now_display()
+            session_state["steps"][index] = merged_step
+        return session_state
+
+    if isinstance(data.get("entries"), list):
+        session_state["user_name"] = normalize_user_name(data.get("user_name"))
+        session_state["user_name_timestamp"] = normalize_timestamp(data.get("user_name_timestamp"))
+        return migrate_legacy_entries(data["entries"], session_state)
+
+    return session_state
+
+
+def load_session_state(sop_data: dict | None = None) -> dict:
+    effective_sop = sop_data or load_sop_data()
+    if not os.path.exists(SESSION_LOG_PATH):
+        return create_default_session(effective_sop)
+    with open(SESSION_LOG_PATH, "r", encoding="utf-8") as file_obj:
+        data = json.load(file_obj)
+    return migrate_session_data(data, effective_sop)
 
 
 def save_session_state(session_state: dict) -> None:
-    with open(SESSION_LOG_PATH, "w") as f:
-        json.dump(session_state, f, indent=2)
-
-
-def save_session_log(entries: list[dict], user_name: str | None = None) -> None:
-    save_session_state({"user_name": normalize_user_name(user_name), "entries": entries})
-
-
-def update_session_user_name(session_state: dict, user_name: str | None) -> None:
-    normalized = normalize_user_name(user_name)
-    if normalized:
-        session_state["user_name"] = normalized
+    with open(SESSION_LOG_PATH, "w", encoding="utf-8") as file_obj:
+        json.dump(session_state, file_obj, indent=2)
 
 
 def step_number_aliases(step_number: int) -> list[str]:
@@ -225,115 +321,56 @@ def match_step_by_text(text: str, sop_steps: list[dict]) -> tuple[int | None, st
     normalized_text = text.lower()
     best_index = None
     best_score = 0
-
     for index, step in enumerate(sop_steps, start=1):
         terms = set(step.get("voice_keywords", []))
         terms.update(step_number_aliases(index))
         step_name = step.get("step_name", "")
         if step_name:
             terms.add(step_name.lower())
-
         score = sum(1 for term in terms if term and term.lower() in normalized_text)
         if score > best_score:
             best_index = index
             best_score = score
-
     if best_index is None or best_score == 0:
         return None, None
-
     return best_index, sop_steps[best_index - 1].get("step_name", f"Step {best_index}")
 
 
-def resolve_step_context(
-    spoken_text: str,
-    requested_step_number: int | None,
-    sop_steps: list[dict],
-) -> tuple[int | None, str | None]:
+def resolve_step_context(spoken_text: str, requested_step_number: int | None, sop_steps: list[dict]) -> tuple[int | None, str | None]:
     if requested_step_number and 1 <= requested_step_number <= len(sop_steps):
-        step_name = sop_steps[requested_step_number - 1].get(
-            "step_name", f"Step {requested_step_number}"
-        )
-        return requested_step_number, step_name
-
+        return requested_step_number, sop_steps[requested_step_number - 1].get("step_name", f"Step {requested_step_number}")
     return match_step_by_text(spoken_text, sop_steps)
-
-
-def append_session_entry(
-    session_state: dict,
-    *,
-    step_number: int | None,
-    step_name: str | None,
-    result: str | None,
-    observation: str | None,
-    flagged: bool,
-    user_name: str | None = None,
-    detected_equipment: list[dict] | None = None,
-) -> dict:
-    update_session_user_name(session_state, user_name)
-    entry = {
-        "step_number": step_number,
-        "step_name": step_name,
-        "result": result,
-        "observation": observation,
-        "timestamp": utc_now_iso(),
-        "flagged": flagged,
-        "user_name": session_state.get("user_name"),
-    }
-    if detected_equipment:
-        entry["detected_equipment"] = detected_equipment
-    session_state["entries"].append(entry)
-    return entry
-
-
-def compile_step_results(sop_data: dict, session_entries: list[dict]) -> list[dict]:
-    step_results = []
-    for index, step in enumerate(sop_data.get("steps", []), start=1):
-        matching_entries = [
-            entry for entry in session_entries if entry.get("step_number") == index
-        ]
-        latest_entry = matching_entries[-1] if matching_entries else None
-        flagged = any(entry.get("flagged", False) for entry in matching_entries)
-        latest_result_entry = next(
-            (entry for entry in reversed(matching_entries) if entry.get("result") in {"pass", "fail"}),
-            None,
-        )
-        latest_observation_entry = next(
-            (entry for entry in reversed(matching_entries) if entry.get("observation")),
-            None,
-        )
-
-        if latest_entry:
-            timestamp_source = latest_result_entry or latest_entry
-            timestamp = timestamp_source.get("timestamp", "Not recorded")
-            observation_source = latest_observation_entry or latest_entry
-            observation = observation_source.get("observation") or "No observation recorded."
-            if flagged:
-                status = "fail"
-            elif latest_result_entry:
-                status = latest_result_entry.get("result", "fail")
-            else:
-                status = "fail"
-        else:
-            timestamp = "Not recorded"
-            observation = "No observation recorded."
-            status = "fail"
-
-        step_results.append(
-            {
-                "step_number": index,
-                "step_name": step.get("step_name", f"Step {index}"),
-                "timestamp": timestamp,
-                "status": status,
-                "flagged": flagged,
-                "observation": observation,
-            }
-        )
-
-    return step_results
 
 
 def contains_negative(text: str) -> bool:
     return find_negative_keyword(text) is not None
+
+
+def get_whisper_model():
+    global _WHISPER_MODEL
+    if _WHISPER_MODEL is not None:
+        return _WHISPER_MODEL
+    try:
+        import whisper
+    except ImportError as exc:
+        raise HTTPException(status_code=503, detail="openai-whisper is not installed") from exc
+    try:
+        _WHISPER_MODEL = whisper.load_model(WHISPER_MODEL_NAME)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to load Whisper model: {exc}") from exc
+    return _WHISPER_MODEL
+
+
+def transcribe_audio_file(audio_path: str) -> str:
+    model = get_whisper_model()
+    try:
+        result = model.transcribe(audio_path, language="en", fp16=False)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Whisper transcription failed: {exc}") from exc
+    transcript = (result.get("text") or "").strip()
+    if not transcript:
+        raise HTTPException(status_code=422, detail="No speech recognized")
+    return transcript
 
 
 def text_to_speech(
@@ -346,7 +383,6 @@ def text_to_speech(
     token = api_key or MINIMAX_API_KEY
     if not token:
         raise ValueError("MINIMAX_API_KEY must be set")
-
     payload = {
         "model": model,
         "text": text,
@@ -357,346 +393,35 @@ def text_to_speech(
             "voice_id": voice_id,
             "speed": speed,
             "vol": 1.0,
-            "pitch": 0
+            "pitch": 0,
         },
         "audio_setting": {
             "sample_rate": 32000,
             "bitrate": 128000,
             "format": "mp3",
-            "channel": 1
-        }
+            "channel": 1,
+        },
     }
-
     headers = {
         "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
     }
-
     response = requests.post(MINIMAX_TTS_URL, json=payload, headers=headers, timeout=60)
-
     if response.status_code != 200:
         raise HTTPException(status_code=response.status_code, detail=f"MiniMax API error: {response.text}")
-
     result = response.json()
-
     if result.get("base_resp", {}).get("status_code") != 0:
-        raise HTTPException(
-            status_code=500,
-            detail=result.get("base_resp", {}).get("status_msg", "MiniMax API error"),
-        )
-
+        raise HTTPException(status_code=500, detail=result.get("base_resp", {}).get("status_msg", "MiniMax API error"))
     audio_hex = result.get("data", {}).get("audio")
     if not audio_hex:
         raise HTTPException(status_code=500, detail="MiniMax API returned no audio")
-
     return bytes.fromhex(audio_hex), result
 
 
-def compile_report_sections(
-    specimen_id: str,
-    technician_name: str,
-    user_name: str,
-    step_results: list[dict],
-) -> dict:
-    if not MINIMAX_API_KEY:
-        flagged = [step for step in step_results if step["flagged"]]
-        passed = [step for step in step_results if step["status"] == "pass"]
-        return {
-            "overview": (
-                f"Report for user {user_name}, specimen {specimen_id}, prepared by technician "
-                f"{technician_name} for {TEST_NAME}."
-            ),
-            "summary": (
-                f"{len(passed)} of {len(step_results)} SOP steps have pass status based on the session log. "
-                "Any missing or flagged steps are marked as fail."
-            ),
-            "flagged_deviations": [
-                f"Step {step['step_number']} - {step['step_name']}: {step['observation']}"
-                for step in flagged
-            ],
-            "final_assessment": (
-                "Manual review required." if flagged else "No flagged deviations recorded."
-            ),
-        }
-
-    prompt_payload = {
-        "specimen_id": specimen_id,
-        "technician_name": technician_name,
-        "user_name": user_name,
-        "test_name": TEST_NAME,
-        "step_results": step_results,
-    }
-    response_format = {
-        "type": "json_schema",
-        "json_schema": {
-            "name": "pathguard_report",
-            "description": "Structured PathGuard laboratory report content.",
-            "schema": {
-                "type": "object",
-                "properties": {
-                    "overview": {"type": "string"},
-                    "summary": {"type": "string"},
-                    "flagged_deviations": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                    },
-                    "final_assessment": {"type": "string"},
-                },
-                "required": [
-                    "overview",
-                    "summary",
-                    "flagged_deviations",
-                    "final_assessment",
-                ],
-            },
-        },
-    }
-    payload = {
-        "model": "MiniMax-Text-01",
-        "temperature": 0.3,
-        "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "You are a laboratory compliance reporting assistant. "
-                    "Write concise, factual report sections for a COVID-19 PCR SOP execution report. "
-                    "Do not invent data. Missing steps should be treated as incomplete."
-                ),
-            },
-            {
-                "role": "user",
-                "content": (
-                    "Create structured report sections for the following execution data. "
-                    "Include a short overview, a summary of overall SOP adherence, a list of flagged deviations, "
-                    "and a final assessment.\n\n"
-                    f"{json.dumps(prompt_payload, indent=2)}"
-                ),
-            },
-        ],
-        "response_format": response_format,
-    }
-    headers = {
-        "Authorization": f"Bearer {MINIMAX_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    response = requests.post(MINIMAX_TEXT_URL, json=payload, headers=headers, timeout=60)
-
-    if response.status_code != 200:
-        raise HTTPException(status_code=response.status_code, detail=f"MiniMax API error: {response.text}")
-
-    result = response.json()
-    if result.get("base_resp", {}).get("status_code") not in (None, 0):
-        raise HTTPException(
-            status_code=500,
-            detail=result.get("base_resp", {}).get("status_msg", "MiniMax text API error"),
-        )
-
-    content = result.get("choices", [{}])[0].get("message", {}).get("content")
-    if not content:
-        raise HTTPException(status_code=500, detail="MiniMax text API returned no report content")
-
-    if isinstance(content, str):
-        try:
-            return json.loads(content)
-        except json.JSONDecodeError:
-            return {
-                "overview": content,
-                "summary": content,
-                "flagged_deviations": [],
-                "final_assessment": content,
-            }
-
-    return content
-
-
-def generate_pdf_report(
-    specimen_id: str,
-    technician_name: str,
-    user_name: str,
-    step_results: list[dict],
-    report_sections: dict,
-) -> None:
-    doc = SimpleDocTemplate(
-        REPORT_PDF_PATH,
-        pagesize=letter,
-        leftMargin=0.6 * inch,
-        rightMargin=0.6 * inch,
-        topMargin=0.6 * inch,
-        bottomMargin=0.6 * inch,
-    )
-    styles = getSampleStyleSheet()
-    flagged_style = ParagraphStyle(
-        "FlaggedText",
-        parent=styles["BodyText"],
-        textColor=colors.red,
-    )
-
-    story = [
-        Paragraph("PathGuard PCR Execution Report", styles["Title"]),
-        Spacer(1, 0.2 * inch),
-    ]
-
-    metadata_table = Table(
-        [
-            ["User Name", user_name],
-            ["Specimen ID", specimen_id],
-            ["Technician Name", technician_name],
-            ["Test Name", TEST_NAME],
-            ["Generated At (UTC)", utc_now_iso()],
-        ],
-        colWidths=[1.8 * inch, 4.7 * inch],
-    )
-    metadata_table.setStyle(
-        TableStyle(
-            [
-                ("BACKGROUND", (0, 0), (0, -1), colors.lightgrey),
-                ("BOX", (0, 0), (-1, -1), 0.5, colors.black),
-                ("INNERGRID", (0, 0), (-1, -1), 0.25, colors.grey),
-                ("VALIGN", (0, 0), (-1, -1), "TOP"),
-            ]
-        )
-    )
-    story.extend([metadata_table, Spacer(1, 0.25 * inch)])
-
-    story.append(Paragraph("Step Execution", styles["Heading2"]))
-    table_rows = [[
-        "Step #",
-        "Step Name",
-        "Timestamp",
-        "Status",
-        "Observation",
-    ]]
-    for step in step_results:
-        status_color = "green" if step["status"] == "pass" else "red"
-        status_cell = Paragraph(
-            f'<font color="{status_color}">{step["status"].upper()}</font>',
-            styles["BodyText"],
-        )
-        observation_style = flagged_style if step["flagged"] else styles["BodyText"]
-        table_rows.append(
-            [
-                str(step["step_number"]),
-                Paragraph(step["step_name"], styles["BodyText"]),
-                Paragraph(step["timestamp"], styles["BodyText"]),
-                status_cell,
-                Paragraph(step["observation"], observation_style),
-            ]
-        )
-
-    step_table = Table(
-        table_rows,
-        colWidths=[0.6 * inch, 1.8 * inch, 1.7 * inch, 0.8 * inch, 2.3 * inch],
-        repeatRows=1,
-    )
-    step_table_style = [
-        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1f4e79")),
-        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-        ("BOX", (0, 0), (-1, -1), 0.5, colors.black),
-        ("INNERGRID", (0, 0), (-1, -1), 0.25, colors.grey),
-        ("VALIGN", (0, 0), (-1, -1), "TOP"),
-        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.whitesmoke, colors.lightyellow]),
-    ]
-    for row_index, step in enumerate(step_results, start=1):
-        if step["flagged"]:
-            step_table_style.append(
-                ("BACKGROUND", (0, row_index), (-1, row_index), colors.HexColor("#ffd9d9"))
-            )
-    step_table.setStyle(TableStyle(step_table_style))
-    story.extend([step_table, Spacer(1, 0.25 * inch)])
-
-    story.append(Paragraph("Overview", styles["Heading2"]))
-    story.extend([Paragraph(report_sections["overview"], styles["BodyText"]), Spacer(1, 0.15 * inch)])
-
-    story.append(Paragraph("Flagged Deviations", styles["Heading2"]))
-    flagged_deviations = report_sections.get("flagged_deviations", [])
-    if flagged_deviations:
-        for item in flagged_deviations:
-            story.append(Paragraph(f"- {item}", flagged_style))
-    else:
-        story.append(Paragraph("No flagged deviations were reported by the LLM summary.", styles["BodyText"]))
-    story.append(Spacer(1, 0.15 * inch))
-
-    story.append(Paragraph("Summary", styles["Heading2"]))
-    story.extend([Paragraph(report_sections["summary"], styles["BodyText"]), Spacer(1, 0.15 * inch)])
-
-    story.append(Paragraph("Final Assessment", styles["Heading2"]))
-    story.append(Paragraph(report_sections["final_assessment"], styles["BodyText"]))
-
-    doc.build(story)
-
-
-def generate_txt_report(
-    specimen_id: str,
-    technician_name: str,
-    user_name: str,
-    step_results: list[dict],
-    report_sections: dict,
-) -> None:
-    lines = [
-        "PathGuard PCR Execution Report",
-        "=" * 30,
-        f"User Name: {user_name}",
-        f"Specimen ID: {specimen_id}",
-        f"Technician Name: {technician_name}",
-        f"Test Name: {TEST_NAME}",
-        f"Generated At (UTC): {utc_now_iso()}",
-        "",
-        "Step Execution",
-        "-" * 14,
-    ]
-
-    for step in step_results:
-        lines.extend(
-            [
-                f"Step {step['step_number']}: {step['step_name']}",
-                f"Timestamp: {step['timestamp']}",
-                f"Status: {step['status'].upper()}",
-                f"Observation: {step['observation']}",
-                f"Flagged: {'Yes' if step['flagged'] else 'No'}",
-                "",
-            ]
-        )
-
-    lines.extend(
-        [
-            "Overview",
-            "-" * 8,
-            report_sections["overview"],
-            "",
-            "Flagged Deviations",
-            "-" * 18,
-        ]
-    )
-
-    flagged_deviations = report_sections.get("flagged_deviations", [])
-    if flagged_deviations:
-        lines.extend(f"- {item}" for item in flagged_deviations)
-    else:
-        lines.append("No flagged deviations were reported by the LLM summary.")
-
-    lines.extend(
-        [
-            "",
-            "Summary",
-            "-" * 7,
-            report_sections["summary"],
-            "",
-            "Final Assessment",
-            "-" * 16,
-            report_sections["final_assessment"],
-            "",
-        ]
-    )
-
-    with open(REPORT_TXT_PATH, "w") as f:
-        f.write("\n".join(lines))
-
-
-def play_audio(audio_bytes: bytes):
+def play_audio(audio_bytes: bytes) -> None:
     with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as temp_file:
         temp_file.write(audio_bytes)
         temp_file_path = temp_file.name
-
     try:
         if os.name == "posix":
             if os.path.exists("/usr/bin/afplay"):
@@ -710,95 +435,143 @@ def play_audio(audio_bytes: bytes):
 
 
 def speak_alert(text: str) -> None:
-    audio_bytes, _ = text_to_speech(
-        text=text,
-        voice_id="female-shaonv",
-        model="speech-2.6-turbo",
-    )
+    audio_bytes, _ = text_to_speech(text=text, voice_id="female-shaonv", model="speech-2.6-turbo")
     play_audio(audio_bytes)
+
+
+def session_step_snapshot(step_record: dict) -> dict:
+    return {
+        "step_number": step_record.get("step_number"),
+        "step_name": step_record.get("step_name"),
+        "voice_input": step_record.get("voice_input", ""),
+        "status": step_record.get("status", "pending"),
+        "timestamp": normalize_timestamp(step_record.get("timestamp")),
+    }
+
+
+def build_report_lines(session_state: dict, generated_timestamp: str) -> list[str]:
+    separator = "================================"
+    lines = [
+        separator,
+        "AUDIT C - LAB QUALITY CONTROL REPORT",
+        separator,
+        f"Technician : {session_state.get('user_name') or 'UNKNOWN'}",
+        f"Login time  : {session_state.get('user_name_timestamp') or 'Not recorded'}",
+        f"Generated   : {generated_timestamp}",
+        separator,
+        "",
+        "STEP RESULTS",
+        "--------------------------------",
+        "Step 0 - Technician name",
+        f"  Input     : {session_state.get('user_name') or 'UNKNOWN'}",
+        f"  Timestamp : {session_state.get('user_name_timestamp') or 'Not recorded'}",
+        f"  Status    : {'PASS' if session_state.get('user_name') else 'PENDING'}",
+        "",
+    ]
+    for step in session_state.get("steps", []):
+        status = (step.get("status") or "pending").upper()
+        lines.extend(
+            [
+                f"Step {step.get('step_number')} - {step.get('step_name')}",
+                f"  Input     : {step.get('voice_input') or '(not recorded)'}",
+                f"  Timestamp : {step.get('timestamp') or 'Not recorded'}",
+                f"  Status    : {status}",
+                "",
+            ]
+        )
+    lines.extend([separator, "END OF REPORT", separator])
+    return lines
+
+
+def create_report_file_paths(user_name: str, report_format: str) -> tuple[str, str]:
+    timestamp = utc_now_file_stamp()
+    safe_user_name = sanitize_filename_component(user_name)
+    file_name = f"auditc_{safe_user_name}_{timestamp}.{report_format}"
+    return file_name, os.path.join(REPORTS_DIR, file_name)
+
+
+def generate_txt_report(report_lines: list[str], report_path: str) -> None:
+    with open(report_path, "w", encoding="utf-8") as file_obj:
+        file_obj.write("\n".join(report_lines))
+
+
+def generate_pdf_report(report_lines: list[str], report_path: str) -> None:
+    doc = SimpleDocTemplate(
+        report_path,
+        pagesize=letter,
+        leftMargin=0.6 * inch,
+        rightMargin=0.6 * inch,
+        topMargin=0.6 * inch,
+        bottomMargin=0.6 * inch,
+    )
+    styles = getSampleStyleSheet()
+    mono_style = ParagraphStyle(
+        "AuditCMono",
+        parent=styles["Code"],
+        fontName="Courier",
+        fontSize=10,
+        leading=14,
+    )
+    story = [
+        Preformatted("\n".join(report_lines), mono_style),
+        Spacer(1, 0.1 * inch),
+    ]
+    doc.build(story)
 
 
 @app.post("/verify-step", response_model=VerifyResponse)
 async def verify_step(request: VerifyRequest, background_tasks: BackgroundTasks):
     try:
         sop_data = load_sop_data()
-        session_state = load_session_state()
+        session_state = load_session_state(sop_data)
     except FileNotFoundError:
         raise HTTPException(status_code=500, detail="Required verification source file not found")
     except json.JSONDecodeError:
         raise HTTPException(status_code=500, detail="Invalid JSON in verification source file")
 
-    step_number, step_name = resolve_step_context(
-        request.spoken_text,
-        request.step_number,
-        sop_data.get("steps", []),
-    )
+    update_session_user_name(session_state, request.user_name)
+    step_number, step_name = resolve_step_context(request.spoken_text, request.step_number, sop_data.get("steps", []))
     matched_keyword = find_negative_keyword(request.spoken_text)
-    timestamp = utc_now_iso()
-
-    if matched_keyword:
-        append_session_entry(
-            session_state,
-            step_number=step_number,
-            step_name=step_name,
-            result="fail",
-            observation=request.spoken_text,
-            flagged=True,
-            user_name=request.user_name,
-        )
-        save_session_state(session_state)
-        response = VerifyResponse(
-            result="fail",
-            step_name=step_name,
-            timestamp=timestamp,
-            matched_keyword=matched_keyword,
-        )
-        if MINIMAX_API_KEY:
-            background_tasks.add_task(speak_alert, "Warning. Issue detected.")
-        return response
-
-    append_session_entry(
+    timestamp = utc_now_display()
+    status = "fail" if matched_keyword else "pass"
+    update_step_state(
         session_state,
         step_number=step_number,
         step_name=step_name,
-        result="pass",
-        observation=request.spoken_text,
-        flagged=False,
-        user_name=request.user_name,
+        voice_input=request.spoken_text,
+        status=status,
+        timestamp=timestamp,
     )
     save_session_state(session_state)
-    response = VerifyResponse(
-        result="pass",
-        step_name=step_name or "Step verified",
-        timestamp=timestamp,
-        matched_keyword="positive",
-    )
-    if MINIMAX_API_KEY:
+
+    if matched_keyword and MINIMAX_API_KEY:
+        background_tasks.add_task(speak_alert, "Warning. Issue detected.")
+    elif MINIMAX_API_KEY:
         background_tasks.add_task(speak_alert, "Verified.")
-    return response
+
+    return VerifyResponse(
+        result=status,
+        step_name=step_name,
+        timestamp=timestamp,
+        matched_keyword=matched_keyword or "positive",
+    )
 
 
 @app.post("/transcribe")
-async def transcribe_audio(
-    request: Request,
-    audio: UploadFile | None = File(default=None),
-):
+async def transcribe_audio(request: Request, audio: UploadFile | None = File(default=None)):
     if audio is not None:
         audio_bytes = await audio.read()
         suffix = os.path.splitext(audio.filename or "")[1] or ".wav"
     else:
         audio_bytes = await request.body()
         suffix = ".wav"
-
     if not audio_bytes:
         raise HTTPException(status_code=400, detail="Audio body is empty")
-
     temp_path = None
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp_file:
             temp_file.write(audio_bytes)
             temp_path = temp_file.name
-
         transcript = transcribe_audio_file(temp_path)
         return {"text": transcript, "transcript": transcript}
     finally:
@@ -813,7 +586,7 @@ async def tts_endpoint(request: TTSRequest):
             text=request.text,
             voice_id=request.voice_id,
             speed=request.speed,
-            model=request.model
+            model=request.model,
         )
         return {
             "status": "success",
@@ -822,8 +595,8 @@ async def tts_endpoint(request: TTSRequest):
             "model": request.model,
             "trace_id": result.get("trace_id"),
         }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
 @app.post("/tts/speak")
@@ -833,7 +606,7 @@ async def tts_speak_endpoint(request: TTSRequest):
             text=request.text,
             voice_id=request.voice_id,
             speed=request.speed,
-            model=request.model
+            model=request.model,
         )
         play_audio(audio_bytes)
         return {
@@ -843,143 +616,123 @@ async def tts_speak_endpoint(request: TTSRequest):
             "model": request.model,
             "trace_id": result.get("trace_id"),
         }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
 @app.post("/log-observation")
 async def log_observation(request: LogObservationRequest):
     try:
         sop_data = load_sop_data()
-        session_state = load_session_state()
+        session_state = load_session_state(sop_data)
     except json.JSONDecodeError:
         raise HTTPException(status_code=500, detail="Invalid JSON in session_log.json")
 
+    update_session_user_name(session_state, request.user_name)
     step_name = None
     steps = sop_data.get("steps", [])
     if 1 <= request.step_number <= len(steps):
         step_name = steps[request.step_number - 1].get("step_name", f"Step {request.step_number}")
-    entry = append_session_entry(
+    status = "fail" if contains_negative(request.spoken_text) else None
+    timestamp = utc_now_display()
+    step_record = update_step_state(
         session_state,
         step_number=request.step_number,
         step_name=step_name,
-        result=None,
-        observation=request.spoken_text,
-        flagged=contains_negative(request.spoken_text),
-        user_name=request.user_name,
+        voice_input=request.spoken_text,
+        status=status,
+        timestamp=timestamp if status else None,
     )
     save_session_state(session_state)
-
-    return {"status": "success", "entry": entry}
+    return {
+        "status": "success",
+        "entry": session_step_snapshot(step_record) if step_record else None,
+        "flagged": contains_negative(request.spoken_text),
+    }
 
 
 @app.post("/flag-issue")
 async def flag_issue(request: FlagIssueRequest | None = None):
     try:
-        session_state = load_session_state()
-        entries = session_state["entries"]
+        sop_data = load_sop_data()
+        session_state = load_session_state(sop_data)
     except json.JSONDecodeError:
         raise HTTPException(status_code=500, detail="Invalid JSON in session_log.json")
 
-    if not entries:
-        raise HTTPException(status_code=404, detail="No session log entries found")
-
-    target_index = None
     target_step = request.step_number if request else None
+    if target_step is None:
+        completed_steps = [step for step in session_state.get("steps", []) if step.get("timestamp")]
+        if completed_steps:
+            target_step = completed_steps[-1].get("step_number")
+    if target_step is None:
+        raise HTTPException(status_code=404, detail="No session step found to flag")
 
-    if target_step is not None:
-        for index in range(len(entries) - 1, -1, -1):
-            if entries[index].get("step_number") == target_step:
-                target_index = index
-                break
-        if target_index is None:
-            raise HTTPException(status_code=404, detail=f"No log entry found for step {target_step}")
-    else:
-        target_index = len(entries) - 1
-
-    entries[target_index]["flagged"] = True
+    step_record = update_step_state(
+        session_state,
+        step_number=target_step,
+        step_name=None,
+        voice_input=None,
+        status="fail",
+        timestamp=utc_now_display(),
+    )
     save_session_state(session_state)
-
-    return {"status": "success", "entry": entries[target_index]}
+    return {"status": "success", "entry": session_step_snapshot(step_record) if step_record else None}
 
 
 @app.post("/generate-report")
 async def generate_report(request: GenerateReportRequest | None = None):
     try:
         sop_data = load_sop_data()
-        session_state = load_session_state()
-        session_entries = session_state["entries"]
-    except FileNotFoundError:
-        raise HTTPException(status_code=500, detail="Required report source file not found")
-    except json.JSONDecodeError:
-        raise HTTPException(status_code=500, detail="Invalid JSON in report source file")
+        request_data = request or GenerateReportRequest()
+        session_state = migrate_session_data(request_data.session, sop_data) if request_data.session else load_session_state(sop_data)
+        update_session_user_name(session_state, request_data.user_name)
+        if not session_state.get("user_name_timestamp") and session_state.get("user_name"):
+            session_state["user_name_timestamp"] = utc_now_display()
+        for step in session_state.get("steps", []):
+            if step.get("status") != "pending" and not step.get("timestamp"):
+                step["timestamp"] = utc_now_display()
 
-    request_data = request or GenerateReportRequest()
-    report_format = request_data.format.lower()
-    if report_format not in {"pdf", "txt"}:
-        raise HTTPException(status_code=400, detail="format must be 'pdf' or 'txt'")
+        report_format = request_data.format.lower()
+        if report_format not in {"pdf", "txt"}:
+            return {"error": "format must be 'pdf' or 'txt'"}
 
-    effective_user_name = (
-        normalize_user_name(request_data.user_name)
-        or normalize_user_name(session_state.get("user_name"))
-        or "UNKNOWN"
-    )
-    step_results = compile_step_results(sop_data, session_entries)
-    report_sections = compile_report_sections(
-        specimen_id=request_data.specimen_id,
-        technician_name=request_data.technician_name,
-        user_name=effective_user_name,
-        step_results=step_results,
-    )
-    update_session_user_name(session_state, request_data.user_name)
-    save_session_state(session_state)
+        generated_timestamp = utc_now_display()
+        report_lines = build_report_lines(session_state, generated_timestamp)
+        file_name, report_path = create_report_file_paths(session_state.get("user_name") or request_data.user_name or "unknown", report_format)
 
-    if report_format == "txt":
-        generate_txt_report(
-            specimen_id=request_data.specimen_id,
-            technician_name=request_data.technician_name,
-            user_name=effective_user_name,
-            step_results=step_results,
-            report_sections=report_sections,
-        )
-        report_path = REPORT_TXT_PATH
-        download_url = "/reports/pathguard_report.txt"
-    else:
-        generate_pdf_report(
-            specimen_id=request_data.specimen_id,
-            technician_name=request_data.technician_name,
-            user_name=effective_user_name,
-            step_results=step_results,
-            report_sections=report_sections,
-        )
-        report_path = REPORT_PDF_PATH
-        download_url = "/reports/pathguard_report.pdf"
+        if report_format == "pdf":
+            generate_pdf_report(report_lines, report_path)
+        else:
+            generate_txt_report(report_lines, report_path)
 
-    return {
-        "status": "success",
-        "report_path": report_path,
-        "format": report_format,
-        "user_name": effective_user_name,
-        "download_url": download_url,
-        "test_name": TEST_NAME,
-        "flagged_count": sum(1 for step in step_results if step["flagged"]),
-    }
+        save_session_state(session_state)
+        return {
+            "status": "success",
+            "format": report_format,
+            "file_name": file_name,
+            "report_path": report_path,
+            "download_url": f"/reports/{file_name}",
+            "session_id": request_data.session_id,
+            "user_name": session_state.get("user_name") or "UNKNOWN",
+        }
+    except Exception as exc:
+        traceback.print_exc()
+        return {"error": str(exc)}
 
 
 @app.get("/reports/{filename}")
 async def download_report(filename: str):
-    allowed_reports = {
-        "pathguard_report.pdf": ("application/pdf", REPORT_PDF_PATH),
-        "pathguard_report.txt": ("text/plain; charset=utf-8", REPORT_TXT_PATH),
-    }
-    if filename not in allowed_reports:
-        raise HTTPException(status_code=404, detail="Report not found")
-
-    media_type, report_path = allowed_reports[filename]
+    safe_filename = os.path.basename(filename)
+    report_path = os.path.join(REPORTS_DIR, safe_filename)
     if not os.path.exists(report_path):
         raise HTTPException(status_code=404, detail="Report file has not been generated yet")
-
-    return FileResponse(report_path, media_type=media_type, filename=filename)
+    if safe_filename.endswith(".pdf"):
+        media_type = "application/pdf"
+    elif safe_filename.endswith(".txt"):
+        media_type = "text/plain; charset=utf-8"
+    else:
+        raise HTTPException(status_code=404, detail="Report not found")
+    return FileResponse(report_path, media_type=media_type, filename=safe_filename)
 
 
 @app.get("/")
@@ -989,4 +742,5 @@ async def root():
 
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run(app, host="0.0.0.0", port=8000)

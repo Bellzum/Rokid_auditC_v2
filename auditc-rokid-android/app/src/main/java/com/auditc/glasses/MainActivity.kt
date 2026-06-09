@@ -37,11 +37,15 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.asRequestBody
 import okhttp3.RequestBody.Companion.toRequestBody
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
 import java.io.RandomAccessFile
+import java.text.SimpleDateFormat
+import java.util.Date
 import java.util.Locale
+import java.util.TimeZone
 import java.util.concurrent.Executors
 import java.util.concurrent.Future
 import java.util.concurrent.ScheduledFuture
@@ -51,6 +55,11 @@ import kotlin.math.max
 class MainActivity : AppCompatActivity() {
 
     private val client = OkHttpClient()
+    private val healthClient = client.newBuilder()
+        .connectTimeout(3, TimeUnit.SECONDS)
+        .readTimeout(3, TimeUnit.SECONDS)
+        .writeTimeout(3, TimeUnit.SECONDS)
+        .build()
     private val handler = Handler(Looper.getMainLooper())
     private val uiScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private val audioExecutor = Executors.newSingleThreadExecutor()
@@ -71,17 +80,22 @@ class MainActivity : AppCompatActivity() {
     private var audioRecord: AudioRecord? = null
     private var recordingFuture: Future<*>? = null
     private var watchdogFuture: ScheduledFuture<*>? = null
+    private var healthCheckFuture: ScheduledFuture<*>? = null
 
     private val sopSteps = listOf(
-        "Step 1: Sample Collection",
-        "Step 2: Reagent Preparation",
-        "Step 3: Sample Transfer",
-        "Step 4: PCR Machine Run",
-        "Step 5: Result Analysis",
+        "Sample Collection",
+        "RNA Extraction",
+        "Reverse Transcription",
+        "PCR Master Mix Preparation",
+        "Thermal Cycling",
+        "Detection and Analysis",
     )
+    private val sessionSteps = sopSteps.mapIndexed { index, name ->
+        SessionStepState(stepNumber = index + 1, stepName = name)
+    }.toMutableList()
     private var currentStep = 0
-    private val stepPassed = MutableList(sopSteps.size) { false }
     private var technicianName: String? = null
+    private var technicianNameTimestamp: String? = null
     private var pendingNameCandidate: String? = null
     private var pendingVoiceMode = VoiceMode.GENERAL
     private var deferredVoiceMode: VoiceMode? = null
@@ -96,6 +110,10 @@ class MainActivity : AppCompatActivity() {
     private var lastOverlayText: String? = null
     private var lastOverlayTextSizeSp: Float? = null
     private var lastOverlayVisible = false
+    private var backendConnected = false
+    private var connectionWarningVisible = false
+    private var activeBackend = BACKEND_USB
+    private var activeBackendLabel = "USB"
 
     private val uiHeartbeatRunnable = object : Runnable {
         override fun run() {
@@ -197,17 +215,23 @@ class MainActivity : AppCompatActivity() {
         }
 
         setupCxrBridge()
-        if (savedInstanceState == null && !sessionStarted) {
-            handler.post { startTechnicianNameFlow() }
+        uiScope.launch {
+            val backendMode = withContext(Dispatchers.IO) { requestHealthStatus() }
+            applyBackendMode(backendMode, announce = true)
+            if (savedInstanceState == null && !sessionStarted) {
+                startTechnicianNameFlow()
+            }
         }
     }
 
     override fun onResume() {
         super.onResume()
         startWatchdog()
+        startHealthChecks()
     }
 
     override fun onPause() {
+        stopHealthChecks()
         stopWatchdog()
         super.onPause()
         if (!restartInProgress && !isExitingApp && !isFinishing && !isDestroyed) {
@@ -242,6 +266,7 @@ class MainActivity : AppCompatActivity() {
         }
         stopWatchdog()
         stopRecordingSession()
+        stopHealthChecks()
         overlayTimer?.let { handler.removeCallbacks(it) }
         toneGenerator?.release()
         toneGenerator = null
@@ -286,6 +311,97 @@ class MainActivity : AppCompatActivity() {
         handler.removeCallbacks(uiHeartbeatRunnable)
         watchdogFuture?.cancel(true)
         watchdogFuture = null
+    }
+
+    private fun startHealthChecks() {
+        healthCheckFuture?.cancel(false)
+        healthCheckFuture = watchdogExecutor.scheduleAtFixedRate(
+            {
+                val backendMode = requestHealthStatus()
+                handler.post { applyBackendMode(backendMode, announce = false) }
+            },
+            HEALTH_CHECK_INITIAL_DELAY_MS,
+            HEALTH_CHECK_INTERVAL_MS,
+            TimeUnit.MILLISECONDS,
+        )
+    }
+
+    private fun stopHealthChecks() {
+        healthCheckFuture?.cancel(true)
+        healthCheckFuture = null
+    }
+
+    private fun requestHealthStatus(): BackendMode {
+        return when {
+            probeBackend(BACKEND_USB) -> BackendMode.USB
+            probeBackend(BACKEND_WIFI) -> BackendMode.WIFI
+            else -> BackendMode.DISCONNECTED
+        }
+    }
+
+    private fun probeBackend(baseUrl: String): Boolean {
+        val request = Request.Builder()
+            .url("$baseUrl/health")
+            .get()
+            .build()
+        return try {
+            healthClient.newCall(request).execute().use { response ->
+                response.isSuccessful
+            }
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    private fun applyBackendMode(mode: BackendMode, announce: Boolean) {
+        val previousBackend = activeBackend
+        when (mode) {
+            BackendMode.USB -> {
+                activeBackend = BACKEND_USB
+                activeBackendLabel = "USB"
+                backendConnected = true
+                connectionWarningVisible = false
+                updateConnectionStatus(true)
+                updateStatusText(technicianName?.let { "Technician: $it" } ?: "Connected via USB")
+                if (announce || previousBackend != BACKEND_USB) {
+                    showOverlay(
+                        background = "#CC00FF41",
+                        text = "Connected via USB",
+                        durationMs = 1600,
+                        textSizeSp = 28f,
+                    )
+                }
+            }
+            BackendMode.WIFI -> {
+                activeBackend = BACKEND_WIFI
+                activeBackendLabel = "WiFi"
+                backendConnected = true
+                connectionWarningVisible = false
+                updateConnectionStatus(true)
+                updateStatusText(technicianName?.let { "Technician: $it" } ?: "Connected via WiFi")
+                if (announce || previousBackend != BACKEND_WIFI) {
+                    showOverlay(
+                        background = "#CC00FF41",
+                        text = "Connected via WiFi",
+                        durationMs = 1600,
+                        textSizeSp = 28f,
+                    )
+                }
+            }
+            BackendMode.DISCONNECTED -> {
+                backendConnected = false
+                updateConnectionStatus(false)
+                updateStatusText("Connection lost")
+                if (!connectionWarningVisible) {
+                    connectionWarningVisible = true
+                    showPersistentOverlay(
+                        background = "#CCFF0000",
+                        text = CONNECTION_LOST_MESSAGE,
+                        textSizeSp = 28f,
+                    )
+                }
+            }
+        }
     }
 
     private fun requestActivityRestart() {
@@ -466,34 +582,38 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun requestTranscript(audioFile: File): String? {
-        val requestBody = MultipartBody.Builder()
-            .setType(MultipartBody.FORM)
-            .addFormDataPart(
-                "audio",
-                audioFile.name,
-                audioFile.asRequestBody("audio/wav".toMediaType()),
-            )
-            .build()
-        val request = Request.Builder()
-            .url("$BASE_URL/transcribe")
-            .post(requestBody)
-            .build()
-
-        return try {
-            client.newCall(request).execute().use { response ->
-                if (!response.isSuccessful) {
-                    null
-                } else {
+        for (backend in orderedBackends()) {
+            val requestBody = MultipartBody.Builder()
+                .setType(MultipartBody.FORM)
+                .addFormDataPart(
+                    "audio",
+                    audioFile.name,
+                    audioFile.asRequestBody("audio/wav".toMediaType()),
+                )
+                .build()
+            val request = Request.Builder()
+                .url("$backend/transcribe")
+                .post(requestBody)
+                .build()
+            try {
+                client.newCall(request).execute().use { response ->
+                    if (!response.isSuccessful) {
+                        return@use
+                    }
                     val payload = JSONObject(response.body?.string().orEmpty())
-                    payload.optString("text")
+                    val transcript = payload.optString("text")
                         .ifBlank { payload.optString("transcript") }
                         .trim()
                         .ifBlank { null }
+                    if (transcript != null) {
+                        markBackendUsed(backend)
+                        return transcript
+                    }
                 }
+            } catch (_: Exception) {
             }
-        } catch (_: Exception) {
-            null
         }
+        return null
     }
 
     private fun writeWaveFile(recorder: AudioRecord, outputFile: File, bufferSize: Int) {
@@ -687,6 +807,7 @@ class MainActivity : AppCompatActivity() {
     private fun saveTechnicianName(name: String) {
         technicianName = name.trim().ifBlank { null }
         val displayName = technicianName ?: return
+        technicianNameTimestamp = currentUtcTimestamp()
         sessionStarted = true
         pendingNameCandidate = null
         setControlsEnabled(true)
@@ -721,42 +842,47 @@ class MainActivity : AppCompatActivity() {
             val result = withContext(Dispatchers.IO) { requestStepVerification(spokenText) }
             if (result == null) {
                 showFailOverlay()
-            } else if (result.result == "pass") {
-                showPassOverlay()
-                sendResultToPhone(result.result, result.stepName)
             } else {
-                showFailOverlay()
-                sendResultToPhone(result.result, result.stepName)
+                updateSessionStep(currentStep, spokenText, result.result, result.timestamp, result.stepName)
+                if (result.result == "pass") {
+                    showPassOverlay()
+                    sendResultToPhone(result.result, result.stepName)
+                } else {
+                    showFailOverlay()
+                    sendResultToPhone(result.result, result.stepName)
+                }
             }
         }
     }
 
     private fun requestStepVerification(spokenText: String): StepResultPayload? {
-        val body = JSONObject().apply {
-            put("spoken_text", spokenText)
-            put("step_number", currentStep + 1)
-            technicianName?.let { put("user_name", it) }
-        }.toString().toRequestBody(jsonMediaType)
-        val request = Request.Builder()
-            .url("$BASE_URL/verify-step")
-            .post(body)
-            .build()
-
-        return try {
-            client.newCall(request).execute().use { response ->
-                if (!response.isSuccessful) {
-                    null
-                } else {
+        for (backend in orderedBackends()) {
+            val body = JSONObject().apply {
+                put("spoken_text", spokenText)
+                put("step_number", currentStep + 1)
+                technicianName?.let { put("user_name", it) }
+            }.toString().toRequestBody(jsonMediaType)
+            val request = Request.Builder()
+                .url("$backend/verify-step")
+                .post(body)
+                .build()
+            try {
+                client.newCall(request).execute().use { response ->
+                    if (!response.isSuccessful) {
+                        return@use
+                    }
                     val json = JSONObject(response.body?.string().orEmpty())
-                    StepResultPayload(
+                    markBackendUsed(backend)
+                    return StepResultPayload(
                         result = json.optString("result", "fail"),
-                        stepName = json.optString("step_name", sopSteps.getOrNull(currentStep).orEmpty()),
+                        stepName = json.optString("step_name", sessionSteps.getOrNull(currentStep)?.stepName.orEmpty()),
+                        timestamp = json.optString("timestamp", currentUtcTimestamp()),
                     )
                 }
+            } catch (_: Exception) {
             }
-        } catch (_: Exception) {
-            null
         }
+        return null
     }
 
     private fun logObservation(text: String) {
@@ -766,10 +892,11 @@ class MainActivity : AppCompatActivity() {
             textSizeSp = 28f,
         )
         uiScope.launch {
-            val flagged = withContext(Dispatchers.IO) { requestObservationLog(text) }
-            if (flagged == null) {
+            val result = withContext(Dispatchers.IO) { requestObservationLog(text) }
+            if (result == null) {
                 showFailOverlay()
-            } else if (flagged) {
+            } else if (result.flagged) {
+                updateSessionStep(currentStep, text, "fail", result.timestamp, null)
                 showIssueFlaggedOverlay()
             } else {
                 showOverlay(
@@ -782,52 +909,63 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun requestObservationLog(text: String): Boolean? {
-        val body = JSONObject().apply {
-            put("spoken_text", text)
-            put("step_number", currentStep + 1)
-            technicianName?.let { put("user_name", it) }
-        }.toString().toRequestBody(jsonMediaType)
-        val request = Request.Builder()
-            .url("$BASE_URL/log-observation")
-            .post(body)
-            .build()
-
-        return try {
-            client.newCall(request).execute().use { response ->
-                if (!response.isSuccessful) {
-                    null
-                } else {
+    private fun requestObservationLog(text: String): ObservationResultPayload? {
+        for (backend in orderedBackends()) {
+            val body = JSONObject().apply {
+                put("spoken_text", text)
+                put("step_number", currentStep + 1)
+                technicianName?.let { put("user_name", it) }
+            }.toString().toRequestBody(jsonMediaType)
+            val request = Request.Builder()
+                .url("$backend/log-observation")
+                .post(body)
+                .build()
+            try {
+                client.newCall(request).execute().use { response ->
+                    if (!response.isSuccessful) {
+                        return@use
+                    }
                     val json = JSONObject(response.body?.string().orEmpty())
                     val entry = json.optJSONObject("entry")
-                    entry?.optBoolean("flagged", false) ?: false
+                    markBackendUsed(backend)
+                    return ObservationResultPayload(
+                        flagged = json.optBoolean("flagged", false),
+                        timestamp = entry?.optString("timestamp", currentUtcTimestamp()) ?: currentUtcTimestamp(),
+                    )
                 }
+            } catch (_: Exception) {
             }
-        } catch (_: Exception) {
-            null
         }
+        return null
     }
 
     private fun generateReport(format: String) {
         val effectiveName = technicianName ?: "Audit C Glasses"
         showPersistentOverlay(
             background = "#66000000",
-            text = "GENERATING ${format.uppercase(Locale.ENGLISH)}...",
+            text = "Generating report...",
             textSizeSp = 28f,
         )
         uiScope.launch {
-            val reportPath = withContext(Dispatchers.IO) { requestReportGeneration(format, effectiveName) }
-            if (reportPath == null) {
-                showFailOverlay()
+            val result = withContext(Dispatchers.IO) { requestReportGeneration(format, effectiveName) }
+            if (result == null || !result.errorMessage.isNullOrBlank()) {
+                showOverlay(
+                    background = "#CCFF0000",
+                    text = "Report failed - check Mac terminal",
+                    durationMs = 2500,
+                    textSizeSp = 28f,
+                )
             } else {
-                updateStatusText(reportPath)
+                val fileName = result.fileName ?: result.reportPath ?: "report.$format"
+                updateStatusText(fileName)
                 showOverlay(
                     background = "#CC00FF41",
-                    text = "${format.uppercase(Locale.ENGLISH)} REPORT READY",
-                    durationMs = 2500,
+                    text = "Report saved on Mac - $fileName",
+                    durationMs = 3000,
+                    textSizeSp = 24f,
                 )
                 tts.speak(
-                    "${format.uppercase(Locale.ENGLISH)} report generated successfully.",
+                    "$format report generated successfully.",
                     TextToSpeech.QUEUE_FLUSH,
                     null,
                     null,
@@ -836,29 +974,36 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun requestReportGeneration(format: String, effectiveName: String): String? {
-        val body = JSONObject().apply {
-            put("technician_name", effectiveName)
-            put("user_name", effectiveName)
-            put("format", format)
-        }.toString().toRequestBody(jsonMediaType)
-        val request = Request.Builder()
-            .url("$BASE_URL/generate-report")
-            .post(body)
-            .build()
-
-        return try {
-            client.newCall(request).execute().use { response ->
-                if (!response.isSuccessful) {
-                    null
-                } else {
-                    JSONObject(response.body?.string().orEmpty())
-                        .optString("report_path", "pathguard_report.$format")
+    private fun requestReportGeneration(format: String, effectiveName: String): ReportResultPayload? {
+        val sessionJson = buildSessionJson(effectiveName)
+        for (backend in orderedBackends()) {
+            val body = JSONObject().apply {
+                put("technician_name", effectiveName)
+                put("user_name", effectiveName)
+                put("format", format)
+                put("session", sessionJson)
+            }.toString().toRequestBody(jsonMediaType)
+            val request = Request.Builder()
+                .url("$backend/generate-report")
+                .post(body)
+                .build()
+            try {
+                client.newCall(request).execute().use { response ->
+                    if (!response.isSuccessful) {
+                        return@use
+                    }
+                    val json = JSONObject(response.body?.string().orEmpty())
+                    markBackendUsed(backend)
+                    return ReportResultPayload(
+                        fileName = json.optString("file_name").ifBlank { null },
+                        reportPath = json.optString("report_path").ifBlank { null },
+                        errorMessage = json.optString("error").ifBlank { null },
+                    )
                 }
+            } catch (_: Exception) {
             }
-        } catch (_: Exception) {
-            null
         }
+        return null
     }
 
     private fun exitApp() {
@@ -892,7 +1037,13 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun updateStepDisplay() {
-        setTextIfChanged(currentStepText, sopSteps.getOrNull(currentStep) ?: "(no step)")
+        val step = sessionSteps.getOrNull(currentStep)
+        val label = if (step != null) {
+            "Step ${step.stepNumber}: ${step.stepName}"
+        } else {
+            "(no step)"
+        }
+        setTextIfChanged(currentStepText, label)
     }
 
     private fun advanceStep(delta: Int) {
@@ -901,10 +1052,9 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun showPassOverlay() {
-        stepPassed[currentStep] = true
         showOverlay(
             background = "#CC00FF41",
-            text = "✓ VERIFIED",
+            text = "VERIFIED",
             durationMs = 2000,
         )
         if (currentStep == sopSteps.lastIndex) {
@@ -919,7 +1069,7 @@ class MainActivity : AppCompatActivity() {
     private fun showFailOverlay() {
         showOverlay(
             background = "#CCFF0000",
-            text = "⚠ WARNING — ISSUE DETECTED",
+            text = "WARNING - ISSUE DETECTED",
             durationMs = 3000,
         )
         tts.speak("Warning. Issue detected. Please review this step.", TextToSpeech.QUEUE_FLUSH, null, null)
@@ -998,11 +1148,11 @@ class MainActivity : AppCompatActivity() {
             text = buildString {
                 appendLine("AUDIT C REPORT")
                 appendLine()
-                stepPassed.forEachIndexed { index, passed ->
-                    appendLine("STEP ${index + 1}: ${if (passed) "PASS" else "PENDING"}")
+                sessionSteps.forEach { step ->
+                    appendLine("STEP ${step.stepNumber}: ${step.status.uppercase(Locale.ENGLISH)}")
                 }
                 appendLine()
-                append("ALL STEPS VERIFIED")
+                append("REPORT READY")
             },
             textSizeSp = 24f,
         )
@@ -1020,12 +1170,14 @@ class MainActivity : AppCompatActivity() {
 
     private fun saveProgressState(bundle: Bundle) {
         bundle.putString(STATE_TECHNICIAN_NAME, technicianName)
+        bundle.putString(STATE_TECHNICIAN_NAME_TIMESTAMP, technicianNameTimestamp)
         bundle.putString(STATE_PENDING_NAME, pendingNameCandidate)
         bundle.putString(STATE_PENDING_VOICE_MODE, pendingVoiceMode.name)
         bundle.putInt(STATE_CURRENT_STEP, currentStep)
         bundle.putBoolean(STATE_SESSION_STARTED, sessionStarted)
-        bundle.putBooleanArray(STATE_STEP_PASSED, stepPassed.toBooleanArray())
         bundle.putString(STATE_STATUS_TEXT, statusBoxText.text.toString())
+        bundle.putString(STATE_ACTIVE_BACKEND, activeBackend)
+        bundle.putString(STATE_SESSION_STEPS, sessionStepsToJson().toString())
     }
 
     private fun restoreProgressState(bundle: Bundle?) {
@@ -1033,18 +1185,88 @@ class MainActivity : AppCompatActivity() {
             return
         }
         technicianName = bundle.getString(STATE_TECHNICIAN_NAME)
+        technicianNameTimestamp = bundle.getString(STATE_TECHNICIAN_NAME_TIMESTAMP)
         pendingNameCandidate = bundle.getString(STATE_PENDING_NAME)
         currentStep = bundle.getInt(STATE_CURRENT_STEP, 0)
         sessionStarted = bundle.getBoolean(STATE_SESSION_STARTED, false)
+        activeBackend = bundle.getString(STATE_ACTIVE_BACKEND, BACKEND_USB)
+        activeBackendLabel = if (activeBackend == BACKEND_WIFI) "WiFi" else "USB"
         bundle.getString(STATE_PENDING_VOICE_MODE)
             ?.let { value -> pendingVoiceMode = runCatching { VoiceMode.valueOf(value) }.getOrDefault(VoiceMode.GENERAL) }
-        val restoredSteps = bundle.getBooleanArray(STATE_STEP_PASSED)
-        restoredSteps?.forEachIndexed { index, passed ->
-            if (index < stepPassed.size) {
-                stepPassed[index] = passed
+        restoreSessionSteps(bundle.getString(STATE_SESSION_STEPS))
+        updateStatusText(bundle.getString(STATE_STATUS_TEXT, statusBoxText.text?.toString() ?: "(awaiting input)"))
+    }
+
+    private fun buildSessionJson(effectiveName: String): JSONObject {
+        return JSONObject().apply {
+            put("user_name", effectiveName)
+            put("user_name_timestamp", technicianNameTimestamp ?: currentUtcTimestamp())
+            put("steps", sessionStepsToJson())
+        }
+    }
+
+    private fun sessionStepsToJson(): JSONArray {
+        val array = JSONArray()
+        sessionSteps.forEach { step ->
+            array.put(
+                JSONObject().apply {
+                    put("step_number", step.stepNumber)
+                    put("step_name", step.stepName)
+                    put("voice_input", step.voiceInput)
+                    put("status", step.status)
+                    put("timestamp", step.timestamp)
+                }
+            )
+        }
+        return array
+    }
+
+    private fun restoreSessionSteps(serializedSteps: String?) {
+        if (serializedSteps.isNullOrBlank()) {
+            return
+        }
+        runCatching {
+            val array = JSONArray(serializedSteps)
+            for (index in 0 until minOf(array.length(), sessionSteps.size)) {
+                val item = array.optJSONObject(index) ?: continue
+                sessionSteps[index].stepName = item.optString("step_name", sessionSteps[index].stepName)
+                sessionSteps[index].voiceInput = item.optString("voice_input", "")
+                sessionSteps[index].status = item.optString("status", "pending")
+                sessionSteps[index].timestamp = item.optString("timestamp", "")
             }
         }
-        updateStatusText(bundle.getString(STATE_STATUS_TEXT, statusBoxText.text?.toString() ?: "(awaiting input)"))
+    }
+
+    private fun updateSessionStep(index: Int, voiceInput: String, status: String, timestamp: String, stepName: String?) {
+        val step = sessionSteps.getOrNull(index) ?: return
+        step.voiceInput = voiceInput
+        step.status = status
+        step.timestamp = timestamp.ifBlank { currentUtcTimestamp() }
+        if (!stepName.isNullOrBlank()) {
+            step.stepName = stepName
+        }
+        updateStepDisplay()
+    }
+
+    private fun orderedBackends(): List<String> {
+        return if (activeBackend == BACKEND_WIFI) {
+            listOf(BACKEND_WIFI, BACKEND_USB)
+        } else {
+            listOf(BACKEND_USB, BACKEND_WIFI)
+        }
+    }
+
+    private fun markBackendUsed(backend: String) {
+        activeBackend = backend
+        activeBackendLabel = if (backend == BACKEND_USB) "USB" else "WiFi"
+        backendConnected = true
+        connectionWarningVisible = false
+    }
+
+    private fun currentUtcTimestamp(): String {
+        val formatter = SimpleDateFormat("yyyy-MM-dd HH:mm:ss 'UTC'", Locale.ENGLISH)
+        formatter.timeZone = TimeZone.getTimeZone("UTC")
+        return formatter.format(Date())
     }
 
     private fun setupCxrBridge() {
@@ -1107,10 +1329,37 @@ class MainActivity : AppCompatActivity() {
     private data class StepResultPayload(
         val result: String,
         val stepName: String,
+        val timestamp: String
     )
 
+    private data class ObservationResultPayload(
+        val flagged: Boolean,
+        val timestamp: String
+    )
+
+    private data class ReportResultPayload(
+        val fileName: String?,
+        val reportPath: String?,
+        val errorMessage: String?
+    )
+
+    private data class SessionStepState(
+        val stepNumber: Int,
+        var stepName: String,
+        var voiceInput: String = "",
+        var status: String = "pending",
+        var timestamp: String = ""
+    )
+
+    private enum class BackendMode {
+        USB,
+        WIFI,
+        DISCONNECTED
+    }
+
     companion object {
-        private const val BASE_URL = "http://127.0.0.1:8000"
+        const val BACKEND_USB = "http://127.0.0.1:8000"
+        const val BACKEND_WIFI = "http://192.168.1.100:8000"
         private const val SAMPLE_RATE_HZ = 16000
         private const val CHANNEL_COUNT = 1
         private const val BITS_PER_SAMPLE = 16
@@ -1123,19 +1372,24 @@ class MainActivity : AppCompatActivity() {
         private const val UI_HEARTBEAT_INTERVAL_MS = 1000L
         private const val RESTART_OVERLAY_DURATION_MS = 500L
         private const val EXIT_OVERLAY_DURATION_MS = 1000L
+        private const val HEALTH_CHECK_INITIAL_DELAY_MS = 0L
+        private const val HEALTH_CHECK_INTERVAL_MS = 30000L
+        private const val CONNECTION_LOST_MESSAGE = "Connection lost - replug USB cable"
         private const val STATE_TECHNICIAN_NAME = "state_technician_name"
+        private const val STATE_TECHNICIAN_NAME_TIMESTAMP = "state_technician_name_timestamp"
         private const val STATE_PENDING_NAME = "state_pending_name"
         private const val STATE_PENDING_VOICE_MODE = "state_pending_voice_mode"
         private const val STATE_CURRENT_STEP = "state_current_step"
         private const val STATE_SESSION_STARTED = "state_session_started"
-        private const val STATE_STEP_PASSED = "state_step_passed"
         private const val STATE_STATUS_TEXT = "state_status_text"
+        private const val STATE_ACTIVE_BACKEND = "state_active_backend"
+        private const val STATE_SESSION_STEPS = "state_session_steps"
     }
 
     private enum class VoiceMode {
         GENERAL,
         CAPTURE_NAME,
         CONFIRM_NAME,
-        OBSERVATION,
+        OBSERVATION
     }
 }

@@ -16,7 +16,7 @@ Built for **Rokid AR glasses**, **TRAE**, **MiniMax TTS**, and a **Python FastAP
 
 - The technician speaks each lab step aloud.
 - The system verifies the spoken step and shows a green overlay for success or a red overlay for a warning.
-- Every verified or flagged step is stored with a **UTC ISO 8601 timestamp**.
+- Every verified or flagged step is stored with a **UTC timestamp** in the format `YYYY-MM-DD HH:MM:SS UTC`.
 - The technician name is captured by **voice at app launch** on the Rokid glasses.
 - The Rokid app is now **voice-only** for the main workflow, with no typing UI.
 - Reports can be exported in **PDF** or **TXT** format.
@@ -163,6 +163,8 @@ Why this matters:
 
 - the glasses app talks to `http://127.0.0.1:8000`
 - `adb reverse` forwards that request through USB to the FastAPI server running on your Mac
+- WiFi network does not affect the app
+- always keep the USB-C cable connected while using Audit C
 
 ### Step 7 — Build and deploy the app to the glasses
 
@@ -178,6 +180,11 @@ cd Rokid_auditC_v2/auditc-rokid-android
 adb -s YOUR_DEVICE_ID install -r app/build/outputs/apk/debug/app-debug.apk
 adb -s YOUR_DEVICE_ID shell am start -n com.auditc.glasses/.MainActivity
 ```
+
+This `JAVA_HOME` uses the Java runtime bundled with Android Studio:
+
+- JetBrains Runtime
+- Java `21.0.10`
 
 What these commands do:
 
@@ -207,16 +214,16 @@ What these commands do:
 Right now, generated reports are:
 
 - available from the backend at:
-  - `/reports/pathguard_report.pdf`
-  - `/reports/pathguard_report.txt`
-- written on your Mac in the project folder as:
-  - `pathguard_report.pdf`
-  - `pathguard_report.txt`
+  - `/reports/auditc_[username]_[YYYYMMDD_HHMMSS].pdf`
+  - `/reports/auditc_[username]_[YYYYMMDD_HHMMSS].txt`
+- written on your Mac in:
+  - `reports/auditc_[username]_[YYYYMMDD_HHMMSS].pdf`
+  - `reports/auditc_[username]_[YYYYMMDD_HHMMSS].txt`
 
 Example download URLs if the backend is running locally:
 
-- `http://127.0.0.1:8000/reports/pathguard_report.pdf`
-- `http://127.0.0.1:8000/reports/pathguard_report.txt`
+- `http://127.0.0.1:8000/reports/auditc_test_user_20260609_105507.pdf`
+- `http://127.0.0.1:8000/reports/auditc_test_user_20260609_105507.txt`
 
 ---
 
@@ -265,6 +272,10 @@ export ANDROID_HOME="$HOME/Desktop/Rokid_auditC_v2/.android-sdk"
 export ANDROID_SDK_ROOT="$HOME/Desktop/Rokid_auditC_v2/.android-sdk"
 ```
 
+This uses the Android Studio bundled JetBrains Runtime:
+
+- Java `21.0.10`
+
 ### Enable ADB on glasses
 
 Do this one time only:
@@ -288,6 +299,7 @@ This script:
 - builds the Rokid Android app
 - installs the APK to the glasses
 - sets up the USB tunnel
+- restores the tunnel automatically if the glasses reconnect
 - launches the app
 
 ### Windows differences
@@ -300,11 +312,18 @@ This script:
 
 ### Recommended first-time Mac workflow
 
+Make the helper scripts executable once:
+
+```bash
+chmod +x setup.sh run_auditc.sh
+```
+
 After cloning, your normal first-time setup becomes:
 
 ```bash
 git clone https://github.com/Bellzum/Rokid_auditC_v2.git
 cd Rokid_auditC_v2
+chmod +x setup.sh run_auditc.sh
 ./setup.sh
 ./run_auditc.sh
 ```
@@ -348,6 +367,18 @@ Workaround:
 adb -s YOUR_DEVICE_ID reverse tcp:8000 tcp:8000
 ```
 
+### Changed WiFi
+
+Workaround:
+
+- no action is needed for WiFi changes
+- the backend communicates through the USB cable via `adb reverse`
+- just make sure the USB cable is connected and run:
+
+```bash
+./run_auditc.sh
+```
+
 ### No report generated
 
 Workaround:
@@ -374,7 +405,9 @@ adb -s YOUR_DEVICE_ID reverse tcp:8000 tcp:8000
 
 ## 6. Next Steps / Roadmap
 
-- Fix report generation from glasses if any remaining device-side edge cases appear during live use.
+- Harden timestamp handling across every session event so technician login, step verification, observations, and flagged issues always keep a valid `YYYY-MM-DD HH:MM:SS UTC` value.
+- Add a report validation pass before export so PDF and TXT reports always contain technician name, login time, step inputs, per-step timestamps, and final PASS or FAIL state.
+- Test report generation from the glasses during live use and handle any remaining device-side edge cases around full-session upload or intermittent transport fallback.
 - Add equipment detection using the glasses camera plus a lightweight YOLO-based model.
 - Update `PathGuardDemoActivity.kt` and `PathGuardRokidActivity.kt` to match the new voice-only flow.
 - Add an offline mode so the app can continue working when the Mac backend is unavailable.
@@ -390,6 +423,7 @@ adb -s YOUR_DEVICE_ID reverse tcp:8000 tcp:8000
 | `/flag-issue` | `POST` | Flag the current step for supervisor review |
 | `/generate-report` | `POST` | Generate a `pdf` or `txt` report |
 | `/reports/{filename}` | `GET` | Download the generated PDF or TXT report |
+| `/health` | `GET` | Return backend health for the USB tunnel check |
 | `/transcribe` | `POST` | Transcribe uploaded audio with local Whisper |
 | `/tts/speak` | `POST` | Speak text through MiniMax TTS |
 

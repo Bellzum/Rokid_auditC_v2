@@ -1,0 +1,134 @@
+INFO:     Will watch for changes in these directories: ['/Users/bellz_um/Desktop/Rokid_auditC_v2']
+INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
+INFO:     Started reloader process [46862] using StatReload
+/Library/Frameworks/Python.framework/Versions/3.10/lib/python3.10/site-packages/requests/__init__.py:113: RequestsDependencyWarning: urllib3 (2.3.0) or chardet (7.4.3)/charset_normalizer (3.4.1) doesn't match a supported version!
+  warnings.warn(
+INFO:     Started server process [46865]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+Loaded sop.json:
+{
+  "steps": [
+    {
+      "step_name": "Sample Collection",
+      "voice_keywords": [
+        "sample",
+        "collect",
+        "swab",
+        "nasal",
+        "throat"
+      ],
+      "description": "Collect respiratory sample from patient using swab"
+    },
+    {
+      "step_name": "RNA Extraction",
+      "voice_keywords": [
+        "extract",
+        "rna",
+        "nucleic",
+        "isolation",
+        "purify"
+      ],
+      "description": "Extract RNA from collected sample"
+    },
+    {
+      "step_name": "Reverse Transcription",
+      "voice_keywords": [
+        "reverse",
+        "transcription",
+        "cdna",
+        "rt",
+        "complement"
+      ],
+      "description": "Convert RNA to complementary DNA"
+    },
+    {
+      "step_name": "PCR Master Mix Preparation",
+      "voice_keywords": [
+        "master",
+        "mix",
+        "prepare",
+        "reagent",
+        "primer",
+        "probe"
+      ],
+      "description": "Prepare PCR reaction mixture with primers and probes"
+    },
+    {
+      "step_name": "Thermal Cycling",
+      "voice_keywords": [
+        "thermal",
+        "cycle",
+        "amplify",
+        "pcr",
+        "temperature",
+        "denature",
+        "anneal",
+        "extend"
+      ],
+      "description": "Run PCR thermal cycling for DNA amplification"
+    },
+    {
+      "step_name": "Detection and Analysis",
+      "voice_keywords": [
+        "detect",
+        "analyze",
+        "result",
+        "positive",
+        "negative",
+        "ct value",
+        "cycle threshold"
+      ],
+      "description": "Detect and analyze amplification results"
+    }
+  ]
+}
+INFO:     127.0.0.1:60301 - "POST /transcribe HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60309 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60309 - "POST /transcribe HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60312 - "POST /transcribe HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60342 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60343 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60359 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60359 - "POST /transcribe HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60362 - "POST /transcribe HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60366 - "POST /transcribe HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60367 - "POST /transcribe HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60370 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60381 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60388 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60391 - "POST /transcribe HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60391 - "POST /verify-step HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60400 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60400 - "POST /transcribe HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60400 - "POST /verify-step HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60406 - "POST /transcribe HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60406 - "POST /verify-step HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60410 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60421 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60424 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60440 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60461 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60469 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60492 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60501 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60512 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60529 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60537 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60550 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60558 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60558 - "POST /generate-report HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60571 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60574 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60590 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60597 - "GET /health HTTP/1.1" 200 OK
+WARNING:  StatReload detected changes in 'main.py'. Reloading...
+INFO:     Shutting down
+INFO:     Waiting for application shutdown.
+INFO:     Application shutdown complete.
+INFO:     Finished server process [46865]
+/Library/Frameworks/Python.framework/Versions/3.10/lib/python3.10/site-packages/requests/__init__.py:113: RequestsDependencyWarning: urllib3 (2.3.0) or chardet (7.4.3)/charset_normalizer (3.4.1) doesn't match a supported version!
+  warnings.warn(
+INFO:     Started server process [84670]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.

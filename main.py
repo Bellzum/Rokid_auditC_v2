@@ -173,6 +173,7 @@ def create_default_session(sop_data: dict, user_name: str | None = None) -> dict
         "user_name": normalize_user_name(user_name),
         "user_name_timestamp": "",
         "steps": steps,
+        "voice_entries": [],
     }
 
 
@@ -233,6 +234,17 @@ def migrate_legacy_entries(entries: list[dict], session_state: dict) -> dict:
         elif entry.get("result") == "pass":
             status = "pass"
         voice_input = entry.get("voice_input") or entry.get("observation") or ""
+        if voice_input:
+            session_state.setdefault("voice_entries", []).append(
+                {
+                    "entry_id": len(session_state.setdefault("voice_entries", [])) + 1,
+                    "step_number": step_number,
+                    "step_name": step_name,
+                    "voice_input": voice_input,
+                    "status": status,
+                    "timestamp": timestamp or utc_now_display(),
+                }
+            )
         if step_number is not None:
             update_step_state(
                 session_state,
@@ -257,6 +269,22 @@ def migrate_session_data(data: object, sop_data: dict) -> dict:
     if isinstance(data.get("steps"), list):
         session_state["user_name"] = normalize_user_name(data.get("user_name"))
         session_state["user_name_timestamp"] = normalize_timestamp(data.get("user_name_timestamp"))
+        voice_entries = data.get("voice_entries")
+        if isinstance(voice_entries, list):
+            session_state["voice_entries"] = []
+            for raw_entry in voice_entries:
+                if not isinstance(raw_entry, dict):
+                    continue
+                session_state["voice_entries"].append(
+                    {
+                        "entry_id": len(session_state["voice_entries"]) + 1,
+                        "step_number": raw_entry.get("step_number"),
+                        "step_name": raw_entry.get("step_name"),
+                        "voice_input": (raw_entry.get("voice_input") or "").strip(),
+                        "status": raw_entry.get("status", "observation") or "observation",
+                        "timestamp": normalize_timestamp(raw_entry.get("timestamp")) or utc_now_display(),
+                    }
+                )
         for index, default_step in enumerate(session_state["steps"]):
             incoming = data["steps"][index] if index < len(data["steps"]) and isinstance(data["steps"][index], dict) else {}
             merged_step = {
@@ -479,6 +507,25 @@ def build_report_lines(session_state: dict, generated_timestamp: str) -> list[st
                 "",
             ]
         )
+    
+    # Add complete voice audit trail if available
+    voice_entries = session_state.get("voice_entries", [])
+    if voice_entries:
+        lines.extend([
+            "COMPLETE AUDIT TRAIL",
+            "--------------------------------",
+        ])
+        for entry in voice_entries:
+            step_info = f"Step {entry.get('step_number', '?')}" if entry.get('step_number') else "General"
+            status = (entry.get("status") or "unknown").upper()
+            lines.extend([
+                f"Entry #{entry.get('entry_id')} - {step_info}",
+                f"  Voice     : {entry.get('voice_input', '(not recorded)')}",
+                f"  Timestamp : {entry.get('timestamp', 'Not recorded')}",
+                f"  Status    : {status}",
+                "",
+            ])
+    
     lines.extend([separator, "END OF REPORT", separator])
     return lines
 
@@ -519,6 +566,100 @@ def generate_pdf_report(report_lines: list[str], report_path: str) -> None:
     doc.build(story)
 
 
+def determine_step_status(spoken_text: str, matched_negative_keyword: str | None) -> str:
+    """Determine step status from voice input with explicit pass/fail indicators."""
+    text_lower = spoken_text.lower().strip()
+
+    positive_phrases = [
+        "no problem",
+        "no problems",
+        "no issue",
+        "no issues",
+        "all good",
+        "looks good",
+        "everything good",
+        "step complete",
+        "step done",
+    ]
+    if any(phrase in text_lower for phrase in positive_phrases):
+        return "pass"
+
+    fail_patterns = [
+        r"\bfail(?:ed|ure)?\b",
+        r"\bnot pass(?:ed)?\b",
+        r"\bnot good\b",
+        r"\bissue\b",
+        r"\bwrong\b",
+        r"\berror\b",
+        r"\bmistake\b",
+        r"\bbroken\b",
+        r"\bcontaminat(?:ed|ion)\b",
+        r"\bexpired\b",
+        r"\bmissing\b",
+        r"\bunclear\b",
+        r"\bturbid\b",
+        r"\bleak\b",
+        r"\bspill\b",
+        r"\babnormal\b",
+        r"\bincorrect\b",
+        r"\bmismatch\b",
+    ]
+    for pattern in fail_patterns:
+        if re.search(pattern, text_lower):
+            return "fail"
+
+    pass_patterns = [
+        r"\bpass(?:ed)?\b",
+        r"\bgood\b",
+        r"\bok(?:ay)?\b",
+        r"\bclear\b",
+        r"\bclean\b",
+        r"\bdone\b",
+        r"\bcomplete\b",
+        r"\bready\b",
+        r"\bverified\b",
+        r"\bcorrect\b",
+        r"\bnormal\b",
+        r"\bfine\b",
+        r"\bsuccess(?:ful)?\b",
+    ]
+    for pattern in pass_patterns:
+        if re.search(pattern, text_lower):
+            return "pass"
+
+    if matched_negative_keyword:
+        return "fail"
+
+    return "observation"
+
+
+def record_voice_entry(session_state: dict, step_number: int | None, step_name: str | None, 
+                      voice_input: str, status: str, timestamp: str) -> None:
+    """Record every voice input as an audit trail entry."""
+    if "voice_entries" not in session_state or not isinstance(session_state.get("voice_entries"), list):
+        session_state["voice_entries"] = []
+
+    entry = {
+        "entry_id": len(session_state["voice_entries"]) + 1,
+        "step_number": step_number,
+        "step_name": step_name,
+        "voice_input": voice_input.strip(),
+        "status": status,
+        "timestamp": timestamp,
+    }
+    session_state["voice_entries"].append(entry)
+
+    if status in ["pass", "fail"] and step_number:
+        update_step_state(
+            session_state,
+            step_number=step_number,
+            step_name=step_name,
+            voice_input=voice_input,
+            status=status,
+            timestamp=timestamp,
+        )
+
+
 @app.post("/verify-step", response_model=VerifyResponse)
 async def verify_step(request: VerifyRequest, background_tasks: BackgroundTasks):
     try:
@@ -533,27 +674,26 @@ async def verify_step(request: VerifyRequest, background_tasks: BackgroundTasks)
     step_number, step_name = resolve_step_context(request.spoken_text, request.step_number, sop_data.get("steps", []))
     matched_keyword = find_negative_keyword(request.spoken_text)
     timestamp = utc_now_display()
-    status = "fail" if matched_keyword else "pass"
-    update_step_state(
-        session_state,
-        step_number=step_number,
-        step_name=step_name,
-        voice_input=request.spoken_text,
-        status=status,
-        timestamp=timestamp,
-    )
+    
+    # Determine status based on explicit voice indicators AND negative keywords
+    status = determine_step_status(request.spoken_text, matched_keyword)
+    
+    # Always record the voice input with timestamp - create complete audit trail
+    record_voice_entry(session_state, step_number, step_name, request.spoken_text, status, timestamp)
     save_session_state(session_state)
 
-    if matched_keyword and MINIMAX_API_KEY:
+    if status == "fail" and MINIMAX_API_KEY:
         background_tasks.add_task(speak_alert, "Warning. Issue detected.")
-    elif MINIMAX_API_KEY:
+    elif status == "pass" and MINIMAX_API_KEY:
         background_tasks.add_task(speak_alert, "Verified.")
+    elif MINIMAX_API_KEY:
+        background_tasks.add_task(speak_alert, "Recorded.")
 
     return VerifyResponse(
         result=status,
         step_name=step_name,
         timestamp=timestamp,
-        matched_keyword=matched_keyword or "positive",
+        matched_keyword=matched_keyword or ("negative" if status == "fail" else "positive"),
     )
 
 
@@ -633,21 +773,22 @@ async def log_observation(request: LogObservationRequest):
     steps = sop_data.get("steps", [])
     if 1 <= request.step_number <= len(steps):
         step_name = steps[request.step_number - 1].get("step_name", f"Step {request.step_number}")
-    status = "fail" if contains_negative(request.spoken_text) else None
+    status = determine_step_status(request.spoken_text, find_negative_keyword(request.spoken_text))
     timestamp = utc_now_display()
-    step_record = update_step_state(
+    record_voice_entry(
         session_state,
-        step_number=request.step_number,
-        step_name=step_name,
-        voice_input=request.spoken_text,
-        status=status,
-        timestamp=timestamp if status else None,
+        request.step_number,
+        step_name,
+        request.spoken_text,
+        status,
+        timestamp,
     )
+    step_record = get_step_record(session_state, request.step_number, step_name)
     save_session_state(session_state)
     return {
         "status": "success",
         "entry": session_step_snapshot(step_record) if step_record else None,
-        "flagged": contains_negative(request.spoken_text),
+        "flagged": status == "fail",
     }
 
 
@@ -667,13 +808,22 @@ async def flag_issue(request: FlagIssueRequest | None = None):
     if target_step is None:
         raise HTTPException(status_code=404, detail="No session step found to flag")
 
+    timestamp = utc_now_display()
     step_record = update_step_state(
         session_state,
         step_number=target_step,
         step_name=None,
         voice_input=None,
         status="fail",
-        timestamp=utc_now_display(),
+        timestamp=timestamp,
+    )
+    record_voice_entry(
+        session_state,
+        target_step,
+        step_record.get("step_name") if step_record else None,
+        "[Issue flagged manually]",
+        "fail",
+        timestamp,
     )
     save_session_state(session_state)
     return {"status": "success", "entry": session_step_snapshot(step_record) if step_record else None}
